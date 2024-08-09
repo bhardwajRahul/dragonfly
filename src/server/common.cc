@@ -18,7 +18,6 @@ extern "C" {
 #include "base/flags.h"
 #include "base/logging.h"
 #include "core/compact_object.h"
-#include "server/cluster/cluster_defs.h"
 #include "server/engine_shard_set.h"
 #include "server/error.h"
 #include "server/journal/journal.h"
@@ -133,31 +132,6 @@ const char* GlobalStateName(GlobalState s) {
   ABSL_UNREACHABLE();
 }
 
-const char* ObjTypeName(int type) {
-  switch (type) {
-    case OBJ_STRING:
-      return "string";
-    case OBJ_LIST:
-      return "list";
-    case OBJ_SET:
-      return "set";
-    case OBJ_ZSET:
-      return "zset";
-    case OBJ_HASH:
-      return "hash";
-    case OBJ_STREAM:
-      return "stream";
-    case OBJ_JSON:
-      return "rejson-rl";
-    case OBJ_SBF:
-      return "MBbloom--";
-
-    default:
-      LOG(ERROR) << "Unsupported type " << type;
-  }
-  return "invalid";
-};
-
 const char* RdbTypeName(unsigned type) {
   switch (type) {
     case RDB_TYPE_STRING:
@@ -258,13 +232,14 @@ bool ParseDouble(string_view src, double* value) {
 #define ADD(x) (x) += o.x
 
 TieredStats& TieredStats::operator+=(const TieredStats& o) {
-  static_assert(sizeof(TieredStats) == 112);
+  static_assert(sizeof(TieredStats) == 144);
 
   ADD(total_stashes);
   ADD(total_fetches);
   ADD(total_cancels);
   ADD(total_deletes);
   ADD(total_defrags);
+  ADD(total_uploads);
   ADD(total_heap_buf_allocs);
   ADD(total_registered_buf_allocs);
 
@@ -278,7 +253,9 @@ TieredStats& TieredStats::operator+=(const TieredStats& o) {
   ADD(small_bins_entries_cnt);
   ADD(small_bins_filling_bytes);
   ADD(total_stash_overflows);
-
+  ADD(cold_storage_bytes);
+  ADD(total_offloading_steps);
+  ADD(total_offloading_stashes);
   return *this;
 }
 
@@ -317,8 +294,11 @@ OpResult<ScanOpts> ScanOpts::TryFrom(CmdArgList args) {
       if (scan_opts.pattern == "*")
         scan_opts.pattern = string_view{};
     } else if (opt == "TYPE") {
-      ToLower(&args[i + 1]);
-      scan_opts.type_filter = ArgS(args, i + 1);
+      auto obj_type = ObjTypeFromString(ArgS(args, i + 1));
+      if (!obj_type) {
+        return facade::OpStatus::SYNTAX_ERR;
+      }
+      scan_opts.type_filter = obj_type;
     } else if (opt == "BUCKET") {
       if (!absl::SimpleAtoi(ArgS(args, i + 1), &scan_opts.bucket_id)) {
         return facade::OpStatus::INVALID_INT;
@@ -471,6 +451,27 @@ RandomPick UniquePicksGenerator::Generate() {
 
   picked_indexes_.insert(max_index);
   return max_index;
+}
+
+ThreadLocalMutex::ThreadLocalMutex() {
+  shard_ = EngineShard::tlocal();
+}
+
+ThreadLocalMutex::~ThreadLocalMutex() {
+  DCHECK_EQ(EngineShard::tlocal(), shard_);
+}
+
+void ThreadLocalMutex::lock() {
+  DCHECK_EQ(EngineShard::tlocal(), shard_);
+  util::fb2::NoOpLock noop_lk_;
+  cond_var_.wait(noop_lk_, [this]() { return !flag_; });
+  flag_ = true;
+}
+
+void ThreadLocalMutex::unlock() {
+  DCHECK_EQ(EngineShard::tlocal(), shard_);
+  flag_ = false;
+  cond_var_.notify_one();
 }
 
 }  // namespace dfly

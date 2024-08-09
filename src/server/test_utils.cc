@@ -5,6 +5,7 @@
 #include "server/test_utils.h"
 
 #include "server/acl/acl_commands_def.h"
+#include "server/acl/acl_family.h"
 #include "util/fibers/fibers.h"
 
 extern "C" {
@@ -29,7 +30,7 @@ using namespace std;
 ABSL_DECLARE_FLAG(string, dbfilename);
 ABSL_DECLARE_FLAG(uint32_t, num_shards);
 ABSL_FLAG(bool, force_epoll, false, "If true, uses epoll api instead iouring to run tests");
-
+ABSL_DECLARE_FLAG(size_t, acllog_max_len);
 namespace dfly {
 
 std::ostream& operator<<(std::ostream& os, const DbStats& stats) {
@@ -80,7 +81,7 @@ void TransactionSuspension::Start() {
 
   transaction_ = new dfly::Transaction{&cid};
 
-  auto st = transaction_->InitByArgs(0, {});
+  auto st = transaction_->InitByArgs(&namespaces.GetDefaultNamespace(), 0, {});
   CHECK_EQ(st, OpStatus::OK);
 
   transaction_->Execute([](Transaction* t, EngineShard* shard) { return OpStatus::OK; }, false);
@@ -106,7 +107,9 @@ class BaseFamilyTest::TestConnWrapper {
   const facade::Connection::InvalidationMessage& GetInvalidationMessage(size_t index) const;
 
   ConnectionContext* cmd_cntx() {
-    return static_cast<ConnectionContext*>(dummy_conn_->cntx());
+    auto cntx = static_cast<ConnectionContext*>(dummy_conn_->cntx());
+    cntx->ns = &namespaces.GetDefaultNamespace();
+    return cntx;
   }
 
   StringVec SplitLines() const {
@@ -167,6 +170,7 @@ void BaseFamilyTest::SetUpTestSuite() {
 }
 
 void BaseFamilyTest::SetUp() {
+  max_memory_limit = INT_MAX;
   ResetService();
 }
 
@@ -203,13 +207,14 @@ void BaseFamilyTest::ResetService() {
   pp_->Run();
   service_ = std::make_unique<Service>(pp_.get());
 
-  Service::InitOpts opts;
-  opts.disable_time_update = true;
-  service_->Init(nullptr, {}, opts);
+  service_->Init(nullptr, {});
   used_mem_current = 0;
 
   TEST_current_time_ms = absl::GetCurrentTimeNanos() / 1000000;
-  auto cb = [&](EngineShard* s) { s->db_slice().UpdateExpireBase(TEST_current_time_ms - 1000, 0); };
+  auto default_ns = &namespaces.GetDefaultNamespace();
+  auto cb = [&](EngineShard* s) {
+    default_ns->GetDbSlice(s->shard_id()).UpdateExpireBase(TEST_current_time_ms - 1000, 0);
+  };
   shard_set->RunBriefInParallel(cb);
 
   const TestInfo* const test_info = UnitTest::GetInstance()->current_test_info();
@@ -243,7 +248,10 @@ void BaseFamilyTest::ResetService() {
           }
 
           LOG(ERROR) << "TxLocks for shard " << es->shard_id();
-          for (const auto& k_v : es->db_slice().GetDBTable(0)->trans_locks) {
+          for (const auto& k_v : namespaces.GetDefaultNamespace()
+                                     .GetDbSlice(es->shard_id())
+                                     .GetDBTable(0)
+                                     ->trans_locks) {
             LOG(ERROR) << "Key " << k_v.first << " " << k_v.second;
           }
         }
@@ -263,6 +271,7 @@ void BaseFamilyTest::ShutdownService() {
 
   service_->Shutdown();
   service_.reset();
+
   delete shard_set;
   shard_set = nullptr;
 
@@ -294,8 +303,9 @@ void BaseFamilyTest::CleanupSnapshots() {
 
 unsigned BaseFamilyTest::NumLocked() {
   atomic_uint count = 0;
+  auto default_ns = &namespaces.GetDefaultNamespace();
   shard_set->RunBriefInParallel([&](EngineShard* shard) {
-    for (const auto& db : shard->db_slice().databases()) {
+    for (const auto& db : default_ns->GetDbSlice(shard->shard_id()).databases()) {
       if (db == nullptr) {
         continue;
       }
@@ -374,6 +384,7 @@ RespExpr BaseFamilyTest::Run(std::string_view id, ArgSlice slice) {
   CmdArgVec args = conn_wrapper->Args(slice);
 
   auto* context = conn_wrapper->cmd_cntx();
+  context->ns = &namespaces.GetDefaultNamespace();
 
   DCHECK(context->transaction == nullptr) << id;
 
@@ -550,12 +561,7 @@ BaseFamilyTest::TestConnWrapper::GetInvalidationMessage(size_t index) const {
 }
 
 bool BaseFamilyTest::IsLocked(DbIndex db_index, std::string_view key) const {
-  ShardId sid = Shard(key, shard_set->size());
-
-  bool is_open = pp_->at(sid)->AwaitBrief([db_index, key] {
-    return EngineShard::tlocal()->db_slice().CheckLock(IntentLock::EXCLUSIVE, db_index, key);
-  });
-  return !is_open;
+  return service_->IsLocked(&namespaces.GetDefaultNamespace(), db_index, key);
 }
 
 string BaseFamilyTest::GetId() const {
@@ -642,7 +648,8 @@ vector<LockFp> BaseFamilyTest::GetLastFps() {
     }
 
     lock_guard lk(mu);
-    for (auto fp : shard->db_slice().TEST_GetLastLockedFps()) {
+    for (auto fp :
+         namespaces.GetDefaultNamespace().GetDbSlice(shard->shard_id()).TEST_GetLastLockedFps()) {
       result.push_back(fp);
     }
   };
@@ -702,9 +709,9 @@ void BaseFamilyTest::SetTestFlag(string_view flag_name, string_view new_value) {
   CHECK(flag->ParseFrom(new_value, &error)) << "Error: " << error;
 }
 
-void BaseFamilyTest::TestInitAclFam() {
+const acl::AclFamily* BaseFamilyTest::TestInitAclFam() {
   absl::SetFlag(&FLAGS_acllog_max_len, 0);
-  service_->TestInit();
+  return service_->TestInit();
 }
 
 }  // namespace dfly

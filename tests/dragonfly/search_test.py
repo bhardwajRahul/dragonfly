@@ -270,7 +270,6 @@ async def test_knn(async_client: aioredis.Redis, index_type, algo_type):
     }
 
     assert await knn_query(i2, "@even:{yes} => [KNN 3 @pos $vec]", [10.0] == {"k8", "k10", "k12"})
-
     await i2.dropindex()
 
 
@@ -480,7 +479,8 @@ def test_redis_om(df_server):
     try:
         import redis_om
     except ModuleNotFoundError:
-        pytest.skip("Redis-om not installed")
+        skip_if_not_in_github()
+        raise
 
     client = redis.Redis(port=df_server.port)
 

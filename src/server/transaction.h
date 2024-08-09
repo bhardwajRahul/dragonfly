@@ -21,6 +21,7 @@
 #include "server/cluster/cluster_utility.h"
 #include "server/common.h"
 #include "server/journal/types.h"
+#include "server/namespaces.h"
 #include "server/table.h"
 #include "server/tx_base.h"
 #include "util/fibers/synchronization.h"
@@ -29,6 +30,7 @@ namespace dfly {
 
 class EngineShard;
 class BlockingController;
+class DbSlice;
 
 using facade::OpResult;
 using facade::OpStatus;
@@ -169,6 +171,14 @@ class Transaction {
     RAN_IMMEDIATELY = 1 << 7,  // Whether the shard executed immediately (during schedule)
   };
 
+  struct Guard {
+    explicit Guard(Transaction* tx);
+    ~Guard();
+
+   private:
+    Transaction* tx;
+  };
+
   explicit Transaction(const CommandId* cid);
 
   // Initialize transaction for squashing placed on a specific shard with a given parent tx
@@ -176,7 +186,7 @@ class Transaction {
                        std::optional<cluster::SlotId> slot_id);
 
   // Initialize from command (args) on specific db.
-  OpStatus InitByArgs(DbIndex index, CmdArgList args);
+  OpStatus InitByArgs(Namespace* ns, DbIndex index, CmdArgList args);
 
   // Get command arguments for specific shard. Called from shard thread.
   ShardArgs GetShardArgs(ShardId sid) const;
@@ -221,17 +231,14 @@ class Transaction {
   void PrepareSquashedMultiHop(const CommandId* cid, absl::FunctionRef<bool(ShardId)> enabled);
 
   // Start multi in GLOBAL mode.
-  void StartMultiGlobal(DbIndex dbid);
+  void StartMultiGlobal(Namespace* ns, DbIndex dbid);
 
   // Start multi in LOCK_AHEAD mode with given keys.
-  void StartMultiLockedAhead(DbIndex dbid, CmdArgList keys, bool skip_scheduling = false);
+  void StartMultiLockedAhead(Namespace* ns, DbIndex dbid, CmdArgList keys,
+                             bool skip_scheduling = false);
 
   // Start multi in NON_ATOMIC mode.
   void StartMultiNonAtomic();
-
-  // Report which shards had write commands that executed on stub transactions
-  // and thus did not mark itself in MultiData::shard_journal_write.
-  void ReportWritesSquashedMulti(absl::FunctionRef<bool(ShardId)> had_write);
 
   // Unlock key locks of a multi transaction.
   void UnlockMulti();
@@ -306,8 +313,14 @@ class Transaction {
   bool IsGlobal() const;
 
   DbContext GetDbContext() const {
-    return DbContext{db_index_, time_now_ms_};
+    return DbContext{namespace_, db_index_, time_now_ms_};
   }
+
+  Namespace& GetNamespace() const {
+    return *namespace_;
+  }
+
+  DbSlice& GetDbSlice(ShardId sid) const;
 
   DbIndex GetDbIndex() const {
     return db_index_;
@@ -323,16 +336,11 @@ class Transaction {
   // Prepares for running ScheduleSingleHop() for a single-shard multi tx.
   // It is safe to call ScheduleSingleHop() after calling this method, but the callback passed
   // to it must not block.
-  void PrepareMultiForScheduleSingleHop(ShardId sid, DbIndex db, CmdArgList args);
+  void PrepareMultiForScheduleSingleHop(Namespace* ns, ShardId sid, DbIndex db, CmdArgList args);
 
-  // Write a journal entry to a shard journal with the given payload. When logging a non-automatic
-  // journal command, multiple journal entries may be necessary. In this case, call with set
-  // multi_commands to true and  call the FinishLogJournalOnShard function after logging the final
-  // entry.
+  // Write a journal entry to a shard journal with the given payload.
   void LogJournalOnShard(EngineShard* shard, journal::Entry::Payload&& payload, uint32_t shard_cnt,
-                         bool multi_commands, bool allow_await) const;
-
-  void FinishLogJournalOnShard(EngineShard* shard, uint32_t shard_cnt) const;
+                         bool allow_await) const;
 
   // Re-enable auto journal for commands marked as NO_AUTOJOURNAL. Call during setup.
   void ReviveAutoJournal();
@@ -342,9 +350,6 @@ class Transaction {
 
   // Get keys multi transaction was initialized with, normalized and unique
   const absl::flat_hash_set<std::pair<ShardId, LockFp>>& GetMultiFps() const;
-
-  // Send journal EXEC opcode after a series of MULTI commands on the currently active shard
-  void FIX_ConcludeJournalExec();
 
   // Print in-dept failure state for debugging.
   std::string DEBUG_PrintFailState(ShardId sid) const;
@@ -442,13 +447,6 @@ class Transaction {
     bool concluding = false;
 
     unsigned cmd_seq_num = 0;  // used for debugging purposes.
-    unsigned shard_journal_cnt;
-
-    // The shard_journal_write vector variable is used to determine the number of shards
-    // involved in a multi-command transaction. This information is utilized by replicas when
-    // executing multi-command. For every write to a shard journal, the corresponding index in the
-    // vector is marked as true.
-    absl::InlinedVector<bool, 4> shard_journal_write;
   };
 
   enum CoordinatorState : uint8_t {
@@ -487,7 +485,7 @@ class Transaction {
   };
 
   // Init basic fields and reset re-usable.
-  void InitBase(DbIndex dbid, CmdArgList args);
+  void InitBase(Namespace* ns, DbIndex dbid, CmdArgList args);
 
   // Init as a global transaction.
   void InitGlobal();
@@ -526,7 +524,7 @@ class Transaction {
   void RunCallback(EngineShard* shard);
 
   // Adds itself to watched queue in the shard. Must run in that shard thread.
-  OpStatus WatchInShard(std::variant<ShardArgs, ArgSlice> keys, EngineShard* shard,
+  OpStatus WatchInShard(Namespace* ns, std::variant<ShardArgs, ArgSlice> keys, EngineShard* shard,
                         KeyReadyChecker krc);
 
   // Expire blocking transaction, unlock keys and unregister it from the blocking controller
@@ -542,9 +540,6 @@ class Transaction {
 
   // Set time_now_ms_
   void InitTxTime();
-
-  // If journaling is enabled, report final exec opcode to finish the chain of commands.
-  void MultiReportJournalOnShard(EngineShard* shard) const;
 
   void UnlockMultiShardCb(absl::Span<const LockFp> fps, EngineShard* shard);
 
@@ -623,6 +618,7 @@ class Transaction {
 
   TxId txid_{0};
   bool global_{false};
+  Namespace* namespace_{nullptr};
   DbIndex db_index_{0};
   uint64_t time_now_ms_{0};
 
@@ -634,6 +630,9 @@ class Transaction {
 
   // Barrier for waking blocking transactions that ensures exclusivity of waking operation.
   BatonBarrier blocking_barrier_{};
+  // Stores status if COORD_CANCELLED was set. Apart from cancelled, it can be moved for cluster
+  // changes
+  OpStatus block_cancel_result_ = OpStatus::OK;
 
   // Transaction coordinator state, written and read by coordinator thread.
   uint8_t coordinator_state_ = 0;

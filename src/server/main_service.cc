@@ -47,6 +47,7 @@ extern "C" {
 #include "server/json_family.h"
 #include "server/list_family.h"
 #include "server/multi_command_squasher.h"
+#include "server/namespaces.h"
 #include "server/script_mgr.h"
 #include "server/search/search_family.h"
 #include "server/server_state.h"
@@ -65,6 +66,11 @@ using facade::ErrorReply;
 
 ABSL_FLAG(int32_t, port, 6379,
           "Redis port. 0 disables the port, -1 will bind on a random available port.");
+
+ABSL_FLAG(std::string, announce_ip, "",
+          "IP address that Dragonfly announces to cluster clients and replication master");
+ABSL_FLAG(uint16_t, announce_port, 0,
+          "Port that Dragonfly announces to cluster clients and replication master");
 
 ABSL_FLAG(uint32_t, memcached_port, 0, "Memcached port");
 
@@ -135,9 +141,11 @@ constexpr size_t kMaxThreadSize = 1024;
 
 // Unwatch all keys for a connection and unregister from DbSlices.
 // Used by UNWATCH, DICARD and EXEC.
-void UnwatchAllKeys(ConnectionState::ExecInfo* exec_info) {
+void UnwatchAllKeys(Namespace* ns, ConnectionState::ExecInfo* exec_info) {
   if (!exec_info->watched_keys.empty()) {
-    auto cb = [&](EngineShard* shard) { shard->db_slice().UnregisterConnectionWatches(exec_info); };
+    auto cb = [&](EngineShard* shard) {
+      ns->GetDbSlice(shard->shard_id()).UnregisterConnectionWatches(exec_info);
+    };
     shard_set->RunBriefInParallel(std::move(cb));
   }
   exec_info->ClearWatched();
@@ -149,7 +157,7 @@ void MultiCleanup(ConnectionContext* cntx) {
     ServerState::tlocal()->ReturnInterpreter(borrowed);
     exec_info.preborrowed_interpreter = nullptr;
   }
-  UnwatchAllKeys(&exec_info);
+  UnwatchAllKeys(cntx->ns, &exec_info);
   exec_info.Clear();
 }
 
@@ -241,7 +249,7 @@ void SendMonitor(const std::string& msg) {
   const auto& monitor_repo = ServerState::tlocal()->Monitors();
   const auto& monitors = monitor_repo.monitors();
   if (!monitors.empty()) {
-    VLOG(1) << "thread " << ProactorBase::me()->GetPoolIndex() << " sending monitor message '"
+    VLOG(2) << "Thread " << ProactorBase::me()->GetPoolIndex() << " sending monitor message '"
             << msg << "' for " << monitors.size();
 
     for (auto monitor_conn : monitors) {
@@ -255,7 +263,7 @@ void DispatchMonitor(ConnectionContext* cntx, const CommandId* cid, CmdArgList t
   //  We have connections waiting to get the info on the last command, send it to them
   string monitor_msg = MakeMonitorMessage(cntx, cid, tail_args);
 
-  VLOG(1) << "sending command '" << monitor_msg << "' to the clients that registered on it";
+  VLOG(2) << "Sending command '" << monitor_msg << "' to the clients that registered on it";
 
   shard_set->pool()->DispatchBrief(
       [msg = std::move(monitor_msg)](unsigned idx, util::ProactorBase*) { SendMonitor(msg); });
@@ -513,7 +521,8 @@ void Topkeys(const http::QueryArgs& args, HttpContext* send) {
     vector<string> rows(shard_set->size());
 
     shard_set->RunBriefInParallel([&](EngineShard* shard) {
-      for (const auto& db : shard->db_slice().databases()) {
+      for (const auto& db :
+           namespaces.GetDefaultNamespace().GetDbSlice(shard->shard_id()).databases()) {
         if (db->top_keys.IsEnabled()) {
           is_enabled = true;
           for (const auto& [key, count] : db->top_keys.GetTopKeys()) {
@@ -625,10 +634,10 @@ void ClusterHtmlPage(const http::QueryArgs& args, HttpContext* send,
   }
 
   if (cluster::IsClusterEnabled()) {
-    if (cluster_family->cluster_config() == nullptr) {
+    if (cluster::ClusterFamily::cluster_config() == nullptr) {
       resp.body() += "<h2>Not yet configured.</h2>\n";
     } else {
-      auto config = cluster_family->cluster_config()->GetConfig();
+      auto config = cluster::ClusterFamily::cluster_config()->GetConfig();
       for (const auto& shard : config) {
         resp.body() += "<div class='master'>\n";
         resp.body() += "<h3>Master</h3>\n";
@@ -710,7 +719,7 @@ Transaction::MultiMode DeduceExecMode(ExecEvalState state,
         StoredCmd cmd = scmd;
         cmd.Fill(&arg_vec);
         auto keys = DetermineKeys(scmd.Cid(), absl::MakeSpan(arg_vec));
-        transactional |= (keys && keys.value().num_args() > 0);
+        transactional |= (keys && keys.value().NumArgs() > 0);
       } else {
         transactional |= scmd.Cid()->IsTransactional();
       }
@@ -791,6 +800,13 @@ struct BorrowedInterpreter {
   bool owned_ = false;
 };
 
+string ConnectionLogContext(const facade::Connection* conn) {
+  if (conn == nullptr) {
+    return "(null-conn)";
+  }
+  return absl::StrCat("(", conn->RemoteEndpointStr(), ")");
+}
+
 }  // namespace
 
 Service::Service(ProactorPool* pp)
@@ -813,6 +829,7 @@ Service::Service(ProactorPool* pp)
   });
 #endif
 
+  CHECK(shard_set == nullptr);
   shard_set = new EngineShardSet(pp);
 
   // We support less than 1024 threads and we support less than 1024 shards.
@@ -830,8 +847,7 @@ Service::~Service() {
   shard_set = nullptr;
 }
 
-void Service::Init(util::AcceptServer* acceptor, std::vector<facade::Listener*> listeners,
-                   const InitOpts& opts) {
+void Service::Init(util::AcceptServer* acceptor, std::vector<facade::Listener*> listeners) {
   InitRedisTables();
 
   config_registry.RegisterMutable("maxmemory", [](const absl::CommandLineFlag& flag) {
@@ -863,13 +879,14 @@ void Service::Init(util::AcceptServer* acceptor, std::vector<facade::Listener*> 
     shard_num = pp_.size();
   }
 
+  ChannelStore* cs = new ChannelStore{};
   // Must initialize before the shard_set because EngineShard::Init references ServerState.
   pp_.AwaitBrief([&](uint32_t index, ProactorBase* pb) {
     tl_facade_stats = new FacadeStats;
     ServerState::Init(index, shard_num, &user_registry_);
+    ServerState::tlocal()->UpdateChannelStore(cs);
   });
 
-  shard_set->Init(shard_num, !opts.disable_time_update);
   const auto tcp_disabled = GetFlag(FLAGS_port) == 0u;
   // We assume that listeners.front() is the main_listener
   // see dfly_main RunEngine
@@ -877,13 +894,12 @@ void Service::Init(util::AcceptServer* acceptor, std::vector<facade::Listener*> 
     acl_family_.Init(listeners.front(), &user_registry_);
   }
 
-  StringFamily::Init(&pp_);
-  GenericFamily::Init(&pp_);
-  server_family_.Init(acceptor, std::move(listeners));
+  // Initialize shard_set with a global callback running once in a while in the shard threads.
+  shard_set->Init(shard_num, [this] { server_family_.GetDflyCmd()->BreakStalledFlowsInShard(); });
 
-  ChannelStore* cs = new ChannelStore{};
-  pp_.AwaitBrief(
-      [cs](uint32_t index, ProactorBase* pb) { ServerState::tlocal()->UpdateChannelStore(cs); });
+  // Requires that shard_set will be initialized before because server_family_.Init might
+  // load the snapshot.
+  server_family_.Init(acceptor, std::move(listeners));
 }
 
 void Service::Shutdown() {
@@ -898,16 +914,18 @@ void Service::Shutdown() {
 
   config_registry.Reset();
 
-  // to shutdown all the runtime components that depend on EngineShard.
-  server_family_.Shutdown();
-  StringFamily::Shutdown();
-  GenericFamily::Shutdown();
+  // to shutdown all the runtime components that depend on EngineShard
+  cluster_family_.Shutdown();
 
+  server_family_.Shutdown();
   engine_varz.reset();
 
   ChannelStore::Destroy();
 
+  shard_set->PreShutdown();
+  namespaces.Clear();
   shard_set->Shutdown();
+
   pp_.Await([](ProactorBase* pb) { ServerState::tlocal()->Destroy(); });
 
   // wait for all the pending callbacks to stop.
@@ -934,10 +952,8 @@ optional<ErrorReply> Service::CheckKeysOwnership(const CommandId* cid, CmdArgLis
   optional<cluster::SlotId> keys_slot;
   bool cross_slot = false;
   // Iterate keys and check to which slot they belong.
-  for (unsigned i = key_index.start; i < key_index.end; i += key_index.step) {
-    string_view key = ArgS(args, i);
-    cluster::SlotId slot = cluster::KeySlot(key);
-    if (keys_slot && slot != *keys_slot) {
+  for (string_view key : key_index.Range(args)) {
+    if (cluster::SlotId slot = cluster::KeySlot(key); keys_slot && slot != *keys_slot) {
       cross_slot = true;  // keys belong to different slots
       break;
     } else {
@@ -949,16 +965,10 @@ optional<ErrorReply> Service::CheckKeysOwnership(const CommandId* cid, CmdArgLis
     return ErrorReply{"-CROSSSLOT Keys in request don't hash to the same slot"};
   }
 
-  // Check keys slot is in my ownership
-  const cluster::ClusterConfig* cluster_config = cluster_family_.cluster_config();
-  if (cluster_config == nullptr) {
-    return ErrorReply{kClusterNotConfigured};
-  }
-
-  if (keys_slot.has_value() && !cluster_config->IsMySlot(*keys_slot)) {
-    // See more details here: https://redis.io/docs/reference/cluster-spec/#moved-redirection
-    cluster::ClusterNodeInfo master = cluster_config->GetMasterNodeForSlot(*keys_slot);
-    return ErrorReply{absl::StrCat("-MOVED ", *keys_slot, " ", master.ip, ":", master.port)};
+  if (keys_slot.has_value()) {
+    if (auto error_str = cluster::SlotOwnershipErrorStr(*keys_slot); error_str) {
+      return ErrorReply{std::move(*error_str)};
+    }
   }
 
   return nullopt;
@@ -982,18 +992,7 @@ optional<ErrorReply> CheckKeysDeclared(const ConnectionState::ScriptInfo& eval_i
   // TODO: Switch to transaction internal locked keys once single hop multi transactions are merged
   // const auto& locked_keys = trans->GetMultiKeys();
   const auto& locked_tags = eval_info.lock_tags;
-
-  const auto& key_index = *key_index_res;
-  for (unsigned i = key_index.start; i < key_index.end; ++i) {
-    string_view key = ArgS(args, i);
-    LockTag tag{key};
-    if (!locked_tags.contains(tag)) {
-      return ErrorReply(absl::StrCat(kUndeclaredKeyErr, ", key: ", key));
-    }
-  }
-
-  if (key_index.bonus) {
-    string_view key = ArgS(args, *key_index.bonus);
+  for (string_view key : key_index_res->Range(args)) {
     if (!locked_tags.contains(LockTag{key})) {
       return ErrorReply(absl::StrCat(kUndeclaredKeyErr, ", key: ", key));
     }
@@ -1028,6 +1027,7 @@ optional<ErrorReply> Service::VerifyCommandExecution(const CommandId* cid,
     uint64_t used_memory = etl.GetUsedMemory(start_ns);
     double oom_deny_ratio = GetFlag(FLAGS_oom_deny_ratio);
     if (used_memory > (max_memory_limit * oom_deny_ratio)) {
+      DLOG(WARNING) << "Out of memory, used " << used_memory << " vs limit " << max_memory_limit;
       etl.stats.oom_error_cmd_cnt++;
       return facade::ErrorReply{kOutOfMemory};
     }
@@ -1046,6 +1046,8 @@ std::optional<ErrorReply> Service::VerifyCommandState(const CommandId* cid, CmdA
   // If there is no connection owner, it means the command it being called
   // from another command or used internally, therefore is always permitted.
   if (dfly_cntx.conn() != nullptr && !dfly_cntx.conn()->IsPrivileged() && cid->IsRestricted()) {
+    VLOG(1) << "Non-admin attempt to execute " << cid->name() << " "
+            << ConnectionLogContext(dfly_cntx.conn());
     return ErrorReply{"Cannot execute restricted command (admin only)"};
   }
 
@@ -1181,17 +1183,16 @@ void Service::DispatchCommand(CmdArgList args, facade::ConnectionContext* cntx) 
     // Bonus points because this allows to continue replication with ACL users who got
     // their access revoked and reinstated
     if (cid->name() == "REPLCONF" && absl::EqualsIgnoreCase(ArgS(args_no_cmd, 0), "ACK")) {
-      auto info_ptr = server_family_.GetReplicaInfo(dfly_cntx);
-      if (info_ptr) {
-        unsigned session_id = dfly_cntx->conn_state.replication_info.repl_session_id;
-        DCHECK(session_id);
-        server_family_.GetDflyCmd()->CancelReplication(session_id, std::move(info_ptr));
-      }
+      server_family_.GetDflyCmd()->OnClose(dfly_cntx);
       return;
     }
     dfly_cntx->SendError(std::move(*err));
     return;
   }
+
+  VLOG_IF(1, cid->opt_mask() & CO::CommandOpt::DANGEROUS)
+      << "Executing dangerous command " << cid->name() << " "
+      << ConnectionLogContext(dfly_cntx->conn());
 
   bool is_trans_cmd = CO::IsTransKind(cid->name());
   if (dfly_cntx->conn_state.exec_info.IsCollecting() && !is_trans_cmd) {
@@ -1211,8 +1212,8 @@ void Service::DispatchCommand(CmdArgList args, facade::ConnectionContext* cntx) 
     DCHECK(dfly_cntx->transaction);
     if (cid->IsTransactional()) {
       dfly_cntx->transaction->MultiSwitchCmd(cid);
-      OpStatus status =
-          dfly_cntx->transaction->InitByArgs(dfly_cntx->conn_state.db_index, args_no_cmd);
+      OpStatus status = dfly_cntx->transaction->InitByArgs(
+          dfly_cntx->ns, dfly_cntx->conn_state.db_index, args_no_cmd);
 
       if (status != OpStatus::OK)
         return cntx->SendError(status);
@@ -1224,7 +1225,9 @@ void Service::DispatchCommand(CmdArgList args, facade::ConnectionContext* cntx) 
       dist_trans.reset(new Transaction{cid});
 
       if (!dist_trans->IsMulti()) {  // Multi command initialize themself based on their mode.
-        if (auto st = dist_trans->InitByArgs(dfly_cntx->conn_state.db_index, args_no_cmd);
+        CHECK(dfly_cntx->ns != nullptr);
+        if (auto st =
+                dist_trans->InitByArgs(dfly_cntx->ns, dfly_cntx->conn_state.db_index, args_no_cmd);
             st != OpStatus::OK)
           return cntx->SendError(st);
       }
@@ -1284,7 +1287,7 @@ OpResult<void> OpTrackKeys(const OpArgs slice_args, const facade::Connection::We
   DVLOG(2) << "Start tracking keys for client ID: " << conn_ref.GetClientId()
            << " with thread ID: " << conn_ref.Thread();
 
-  auto& db_slice = slice_args.shard->db_slice();
+  auto& db_slice = slice_args.GetDbSlice();
   // TODO: There is a bug here that we track all arguments instead of tracking only keys.
   for (auto key : args) {
     DVLOG(2) << "Inserting client ID " << conn_ref.GetClientId()
@@ -1580,6 +1583,7 @@ facade::ConnectionContext* Service::CreateContext(util::FiberSocketBase* peer,
                                                   facade::Connection* owner) {
   auto cred = user_registry_.GetCredentials("default");
   ConnectionContext* res = new ConnectionContext{peer, owner, std::move(cred)};
+  res->ns = &namespaces.GetOrInsert("");
 
   if (peer->IsUDS()) {
     res->req_auth = false;
@@ -1592,10 +1596,9 @@ facade::ConnectionContext* Service::CreateContext(util::FiberSocketBase* peer,
 
   // a bit of a hack. I set up breaker callback here for the owner.
   // Should work though it's confusing to have it here.
-  owner->RegisterBreakHook([res, this](uint32_t) {
+  owner->RegisterBreakHook([res](uint32_t) {
     if (res->transaction)
       res->transaction->CancelBlocking(nullptr);
-    this->server_family().BreakOnShutdown();
   });
 
   return res;
@@ -1605,10 +1608,10 @@ const CommandId* Service::FindCmd(std::string_view cmd) const {
   return registry_.Find(registry_.RenamedOrOriginal(cmd));
 }
 
-bool Service::IsLocked(DbIndex db_index, std::string_view key) const {
+bool Service::IsLocked(Namespace* ns, DbIndex db_index, std::string_view key) const {
   ShardId sid = Shard(key, shard_count());
-  bool is_open = pp_.at(sid)->AwaitBrief([db_index, key] {
-    return EngineShard::tlocal()->db_slice().CheckLock(IntentLock::EXCLUSIVE, db_index, key);
+  bool is_open = pp_.at(sid)->AwaitBrief([db_index, key, ns, sid] {
+    return ns->GetDbSlice(sid).CheckLock(IntentLock::EXCLUSIVE, db_index, key);
   });
   return !is_open;
 }
@@ -1659,9 +1662,10 @@ void Service::Watch(CmdArgList args, ConnectionContext* cntx) {
 
   atomic_uint32_t keys_existed = 0;
   auto cb = [&](Transaction* t, EngineShard* shard) {
-    ShardArgs largs = t->GetShardArgs(shard->shard_id());
+    ShardId shard_id = shard->shard_id();
+    ShardArgs largs = t->GetShardArgs(shard_id);
     for (auto k : largs) {
-      shard->db_slice().RegisterWatchedKey(cntx->db_index(), k, &exec_info);
+      t->GetDbSlice(shard_id).RegisterWatchedKey(cntx->db_index(), k, &exec_info);
     }
 
     auto res = GenericFamily::OpExists(t->GetOpArgs(shard), largs);
@@ -1680,7 +1684,7 @@ void Service::Watch(CmdArgList args, ConnectionContext* cntx) {
 }
 
 void Service::Unwatch(CmdArgList args, ConnectionContext* cntx) {
-  UnwatchAllKeys(&cntx->conn_state.exec_info);
+  UnwatchAllKeys(cntx->ns, &cntx->conn_state.exec_info);
   return cntx->SendOk();
 }
 
@@ -1839,6 +1843,7 @@ Transaction::MultiMode DetermineMultiMode(ScriptMgr::ScriptParams params) {
 optional<bool> StartMultiEval(DbIndex dbid, CmdArgList keys, ScriptMgr::ScriptParams params,
                               ConnectionContext* cntx) {
   Transaction* trans = cntx->transaction;
+  Namespace* ns = cntx->ns;
   Transaction::MultiMode script_mode = DetermineMultiMode(params);
   Transaction::MultiMode multi_mode = trans->GetMultiMode();
   // Check if eval is already part of a running multi transaction
@@ -1858,10 +1863,10 @@ optional<bool> StartMultiEval(DbIndex dbid, CmdArgList keys, ScriptMgr::ScriptPa
 
   switch (script_mode) {
     case Transaction::GLOBAL:
-      trans->StartMultiGlobal(dbid);
+      trans->StartMultiGlobal(ns, dbid);
       return true;
     case Transaction::LOCK_AHEAD:
-      trans->StartMultiLockedAhead(dbid, keys);
+      trans->StartMultiLockedAhead(ns, dbid, keys);
       return true;
     case Transaction::NON_ATOMIC:
       trans->StartMultiNonAtomic();
@@ -1986,21 +1991,20 @@ void Service::EvalInternal(CmdArgList args, const EvalArgs& eval_args, Interpret
     });
 
     ++ServerState::tlocal()->stats.eval_shardlocal_coordination_cnt;
-    tx->PrepareMultiForScheduleSingleHop(*sid, tx->GetDbIndex(), args);
+    tx->PrepareMultiForScheduleSingleHop(cntx->ns, *sid, tx->GetDbIndex(), args);
     tx->ScheduleSingleHop([&](Transaction*, EngineShard*) {
       boost::intrusive_ptr<Transaction> stub_tx =
           new Transaction{tx, *sid, slot_checker.GetUniqueSlotId()};
       cntx->transaction = stub_tx.get();
 
       result = interpreter->RunFunction(eval_args.sha, &error);
-      cntx->transaction->FIX_ConcludeJournalExec();  // flush journal
 
       cntx->transaction = tx;
       return OpStatus::OK;
     });
 
     if (*sid != ServerState::tlocal()->thread_index()) {
-      VLOG(1) << "Migrating connection " << cntx->conn() << " from "
+      VLOG(2) << "Migrating connection " << cntx->conn() << " from "
               << ProactorBase::me()->GetPoolIndex() << " to " << *sid;
       cntx->conn()->RequestAsyncMigration(shard_set->pool()->at(*sid));
     }
@@ -2076,7 +2080,7 @@ bool CheckWatchedKeyExpiry(ConnectionContext* cntx, const CommandRegistry& regis
   };
 
   cntx->transaction->MultiSwitchCmd(registry.Find(EXISTS));
-  cntx->transaction->InitByArgs(cntx->conn_state.db_index, CmdArgList{str_list});
+  cntx->transaction->InitByArgs(cntx->ns, cntx->conn_state.db_index, CmdArgList{str_list});
   OpStatus status = cntx->transaction->ScheduleSingleHop(std::move(cb));
   CHECK_EQ(OpStatus::OK, status);
 
@@ -2112,13 +2116,8 @@ template <typename F> void IterateAllKeys(ConnectionState::ExecInfo* exec_info, 
     if (!key_res.ok())
       continue;
 
-    auto key_index = key_res.value();
-
-    for (unsigned i = key_index.start; i < key_index.end; i += key_index.step)
+    for (unsigned i : key_res->Range())
       f(arg_vec[i]);
-
-    if (key_index.bonus)
-      f(arg_vec[*key_index.bonus]);
   }
 }
 
@@ -2132,15 +2131,17 @@ CmdArgVec CollectAllKeys(ConnectionState::ExecInfo* exec_info) {
 }
 
 // Return true if transaction was scheduled, false if scheduling was not required.
-void StartMultiExec(DbIndex dbid, Transaction* trans, ConnectionState::ExecInfo* exec_info,
+void StartMultiExec(ConnectionContext* cntx, ConnectionState::ExecInfo* exec_info,
                     Transaction::MultiMode multi_mode) {
+  auto trans = cntx->transaction;
+  auto dbid = cntx->db_index();
   switch (multi_mode) {
     case Transaction::GLOBAL:
-      trans->StartMultiGlobal(dbid);
+      trans->StartMultiGlobal(cntx->ns, dbid);
       break;
     case Transaction::LOCK_AHEAD: {
       auto vec = CollectAllKeys(exec_info);
-      trans->StartMultiLockedAhead(dbid, absl::MakeSpan(vec));
+      trans->StartMultiLockedAhead(cntx->ns, dbid, absl::MakeSpan(vec));
     } break;
     case Transaction::NON_ATOMIC:
       trans->StartMultiNonAtomic();
@@ -2190,7 +2191,7 @@ void Service::Exec(CmdArgList args, ConnectionContext* cntx) {
 
   bool scheduled = false;
   if (multi_mode != Transaction::NOT_DETERMINED) {
-    StartMultiExec(cntx->db_index(), cntx->transaction, &exec_info, multi_mode);
+    StartMultiExec(cntx, &exec_info, multi_mode);
     scheduled = true;
   }
 
@@ -2202,7 +2203,7 @@ void Service::Exec(CmdArgList args, ConnectionContext* cntx) {
 
   exec_info.state = ConnectionState::ExecInfo::EXEC_RUNNING;
 
-  VLOG(1) << "StartExec " << exec_info.body.size();
+  VLOG(2) << "StartExec " << exec_info.body.size();
 
   // Make sure we flush whatever responses we aggregated in the reply builder.
   SinkReplyBuilder::ReplyAggregator agg(rb);
@@ -2231,7 +2232,7 @@ void Service::Exec(CmdArgList args, ConnectionContext* cntx) {
         CmdArgList args = absl::MakeSpan(arg_vec);
 
         if (scmd.Cid()->IsTransactional()) {
-          OpStatus st = cntx->transaction->InitByArgs(cntx->conn_state.db_index, args);
+          OpStatus st = cntx->transaction->InitByArgs(cntx->ns, cntx->conn_state.db_index, args);
           if (st != OpStatus::OK) {
             cntx->SendError(st);
             break;
@@ -2441,7 +2442,7 @@ void Service::Command(CmdArgList args, ConnectionContext* cntx) {
 VarzValue::Map Service::GetVarzStats() {
   VarzValue::Map res;
 
-  Metrics m = server_family_.GetMetrics();
+  Metrics m = server_family_.GetMetrics(&namespaces.GetDefaultNamespace());
   DbStats db_stats;
   for (const auto& s : m.db_stats) {
     db_stats += s;
@@ -2523,7 +2524,7 @@ void Service::ConfigureHttpHandlers(util::HttpListenerBase* base, bool is_privil
   }
 }
 
-void Service::OnClose(facade::ConnectionContext* cntx) {
+void Service::OnConnectionClose(facade::ConnectionContext* cntx) {
   ConnectionContext* server_cntx = static_cast<ConnectionContext*>(cntx);
   ConnectionState& conn_state = server_cntx->conn_state;
 
@@ -2540,7 +2541,7 @@ void Service::OnClose(facade::ConnectionContext* cntx) {
     DCHECK(!conn_state.subscribe_info);
   }
 
-  UnwatchAllKeys(&conn_state.exec_info);
+  UnwatchAllKeys(server_cntx->ns, &conn_state.exec_info);
 
   DeactivateMonitoring(server_cntx);
 
@@ -2630,8 +2631,9 @@ void Service::RegisterCommands() {
   server_family_.Register(&registry_);
   cluster_family_.Register(&registry_);
 
+  // AclFamily should always be registered last
+  // If we add a new familly, register that first above and *not* below
   acl_family_.Register(&registry_);
-  acl::BuildIndexers(registry_.GetFamilies(), &registry_);
 
   // Only after all the commands are registered
   registry_.Init(pp_.size());
@@ -2659,8 +2661,9 @@ void Service::RegisterCommands() {
   }
 }
 
-void Service::TestInit() {
+const acl::AclFamily* Service::TestInit() {
   acl_family_.Init(nullptr, &user_registry_);
+  return &acl_family_;
 }
 
 void SetMaxMemoryFlag(uint64_t value) {

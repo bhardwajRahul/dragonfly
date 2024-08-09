@@ -28,8 +28,11 @@ class Journal;
 class TieredStorage;
 class ShardDocIndices;
 class BlockingController;
+class EngineShardSet;
 
 class EngineShard {
+  friend class EngineShardSet;
+
  public:
   struct Stats {
     uint64_t defrag_attempt_total = 0;
@@ -48,7 +51,10 @@ class EngineShard {
 
   // Sets up a new EngineShard in the thread.
   // If update_db_time is true, initializes periodic time update for its db_slice.
-  static void InitThreadLocal(util::ProactorBase* pb, bool update_db_time, size_t max_file_size);
+  static void InitThreadLocal(util::ProactorBase* pb);
+
+  // Must be called after all InitThreadLocal() have finished
+  void InitTieredStorage(util::ProactorBase* pb, size_t max_file_size);
 
   static void DestroyThreadLocal();
 
@@ -57,15 +63,7 @@ class EngineShard {
   }
 
   ShardId shard_id() const {
-    return db_slice_.shard_id();
-  }
-
-  DbSlice& db_slice() {
-    return db_slice_;
-  }
-
-  const DbSlice& db_slice() const {
-    return db_slice_;
+    return shard_id_;
   }
 
   PMR_NS::memory_resource* memory_resource() {
@@ -121,12 +119,6 @@ class EngineShard {
     return shard_search_indices_.get();
   }
 
-  BlockingController* EnsureBlockingController();
-
-  BlockingController* blocking_controller() {
-    return blocking_controller_.get();
-  }
-
   // for everyone to use for string transformations during atomic cpu sequences.
   sds tmp_str1;
 
@@ -158,7 +150,7 @@ class EngineShard {
     return continuation_trans_;
   }
 
-  void TEST_EnableHeartbeat();
+  void StopPeriodicFiber();
 
   struct TxQueueInfo {
     // Armed - those that the coordinator has armed with callbacks and wants them to run.
@@ -211,10 +203,12 @@ class EngineShard {
   // blocks the calling fiber.
   void Shutdown();  // called before destructing EngineShard.
 
-  void StartPeriodicFiber(util::ProactorBase* pb);
+  void StartPeriodicFiber(util::ProactorBase* pb, std::function<void()> shard_handler);
 
   void Heartbeat();
-  void RunPeriodic(std::chrono::milliseconds period_ms);
+  void RetireExpiredAndEvict();
+
+  void RunPeriodic(std::chrono::milliseconds period_ms, std::function<void()> shard_handler);
 
   void CacheStats();
 
@@ -239,12 +233,15 @@ class EngineShard {
 
   TxQueue txq_;
   MiMemoryResource mi_resource_;
-  DbSlice db_slice_;
+  ShardId shard_id_;
 
   Stats stats_;
 
   // Become passive if replica: don't automatially evict expired items.
   bool is_replica_ = false;
+
+  size_t last_cached_used_memory_ = 0;
+  uint64_t cache_stats_time_ = 0;  // monotonic, set by ProactorBase::GetMonotonicTimeNs.
 
   // Logical ts used to order distributed transactions.
   TxId committed_txid_ = 0;
@@ -258,8 +255,8 @@ class EngineShard {
 
   DefragTaskState defrag_state_;
   std::unique_ptr<TieredStorage> tiered_storage_;
+  // TODO: Move indices to Namespace
   std::unique_ptr<ShardDocIndices> shard_search_indices_;
-  std::unique_ptr<BlockingController> blocking_controller_;
 
   using Counter = util::SlidingCounter<7>;
 
@@ -291,10 +288,14 @@ class EngineShardSet {
     return pp_;
   }
 
-  void Init(uint32_t size, bool update_db_time);
-  void Shutdown();
+  void Init(uint32_t size, std::function<void()> shard_handler);
 
-  static const std::vector<CachedStats>& GetCachedStats();
+  // Shutdown sequence:
+  // - EngineShardSet.PreShutDown()
+  // - Namespaces.Clear()
+  // - EngineShardSet.Shutdown()
+  void PreShutdown();
+  void Shutdown();
 
   // Uses a shard queue to dispatch. Callback runs in a dedicated fiber.
   template <typename F> auto Await(ShardId sid, F&& f) {
@@ -341,11 +342,10 @@ class EngineShardSet {
   }
 
   // Used in tests
-  void TEST_EnableHeartBeat();
   void TEST_EnableCacheMode();
 
  private:
-  void InitThreadLocal(util::ProactorBase* pb, bool update_db_time, size_t max_file_size);
+  void InitThreadLocal(util::ProactorBase* pb);
 
   util::ProactorPool* pp_;
   std::vector<TaskQueue*> shard_queue_;

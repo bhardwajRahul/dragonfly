@@ -9,12 +9,39 @@
 #include "server/cluster/cluster_defs.h"
 #include "server/engine_shard_set.h"
 #include "server/journal/journal.h"
+#include "server/namespaces.h"
 #include "server/transaction.h"
 
 namespace dfly {
 
 using namespace std;
 using Payload = journal::Entry::Payload;
+
+unsigned KeyIndex::operator*() const {
+  if (bonus)
+    return *bonus;
+  return start;
+}
+
+KeyIndex& KeyIndex::operator++() {
+  if (bonus)
+    bonus.reset();
+  else
+    start = std::min(end, start + step);
+  return *this;
+}
+
+bool KeyIndex::operator!=(const KeyIndex& ki) const {
+  return std::tie(start, end, step, bonus) != std::tie(ki.start, ki.end, ki.step, ki.bonus);
+}
+
+DbSlice& DbContext::GetDbSlice(ShardId shard_id) const {
+  return ns->GetDbSlice(shard_id);
+}
+
+DbSlice& OpArgs::GetDbSlice() const {
+  return db_cntx.GetDbSlice(shard->shard_id());
+}
 
 size_t ShardArgs::Size() const {
   size_t sz = 0;
@@ -24,21 +51,15 @@ size_t ShardArgs::Size() const {
 }
 
 void RecordJournal(const OpArgs& op_args, string_view cmd, const ShardArgs& args,
-                   uint32_t shard_cnt, bool multi_commands) {
+                   uint32_t shard_cnt) {
   VLOG(2) << "Logging command " << cmd << " from txn " << op_args.tx->txid();
-  op_args.tx->LogJournalOnShard(op_args.shard, Payload(cmd, args), shard_cnt, multi_commands,
-                                false);
+  op_args.tx->LogJournalOnShard(op_args.shard, Payload(cmd, args), shard_cnt, false);
 }
 
 void RecordJournal(const OpArgs& op_args, std::string_view cmd, facade::ArgSlice args,
-                   uint32_t shard_cnt, bool multi_commands) {
+                   uint32_t shard_cnt) {
   VLOG(2) << "Logging command " << cmd << " from txn " << op_args.tx->txid();
-  op_args.tx->LogJournalOnShard(op_args.shard, Payload(cmd, args), shard_cnt, multi_commands,
-                                false);
-}
-
-void RecordJournalFinish(const OpArgs& op_args, uint32_t shard_cnt) {
-  op_args.tx->FinishLogJournalOnShard(op_args.shard, shard_cnt);
+  op_args.tx->LogJournalOnShard(op_args.shard, Payload(cmd, args), shard_cnt, false);
 }
 
 void RecordExpiry(DbIndex dbid, string_view key) {

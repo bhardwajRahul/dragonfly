@@ -21,15 +21,19 @@
 #include "server/error.h"
 #include "server/journal/journal.h"
 #include "server/main_service.h"
+#include "server/namespaces.h"
 #include "server/server_family.h"
 #include "server/server_state.h"
 
-ABSL_FLAG(std::string, cluster_announce_ip, "", "ip that cluster commands announce to the client");
+ABSL_FLAG(std::string, cluster_announce_ip, "", "DEPRECATED: use --announce_ip");
+
 ABSL_FLAG(std::string, cluster_node_id, "",
           "ID within a cluster, used for slot assignment. MUST be unique. If empty, uses master "
           "replication ID (random string)");
 
 ABSL_DECLARE_FLAG(int32_t, port);
+ABSL_DECLARE_FLAG(std::string, announce_ip);
+ABSL_DECLARE_FLAG(uint16_t, announce_port);
 
 namespace dfly {
 namespace acl {
@@ -65,6 +69,16 @@ ClusterFamily::ClusterFamily(ServerFamily* server_family) : server_family_(serve
 
   InitializeCluster();
 
+  // TODO: Remove flag cluster_announce_ip in v1.23+
+  if (!absl::GetFlag(FLAGS_cluster_announce_ip).empty()) {
+    CHECK(absl::GetFlag(FLAGS_announce_ip).empty())
+        << "Can't use both --cluster_announce_ip and --announce_ip";
+
+    LOG(WARNING) << "WARNING: Flag --cluster_announce_ip is deprecated in favor of --announce_ip. "
+                    "Use the latter, as the former will be removed in a future release.";
+    absl::SetFlag(&FLAGS_announce_ip, absl::GetFlag(FLAGS_cluster_announce_ip));
+  }
+
   id_ = absl::GetFlag(FLAGS_cluster_node_id);
   if (id_.empty()) {
     id_ = server_family_->master_replid();
@@ -78,23 +92,40 @@ ClusterConfig* ClusterFamily::cluster_config() {
   return tl_cluster_config.get();
 }
 
+void ClusterFamily::Shutdown() {
+  shard_set->pool()->at(0)->Await([this] {
+    lock_guard lk(set_config_mu);
+    if (!tl_cluster_config)
+      return;
+
+    auto empty_config = tl_cluster_config->CloneWithoutMigrations();
+    RemoveOutgoingMigrations(empty_config, tl_cluster_config);
+    RemoveIncomingMigrations(empty_config->GetFinishedIncomingMigrations(tl_cluster_config));
+
+    DCHECK(outgoing_migration_jobs_.empty());
+    DCHECK(incoming_migrations_jobs_.empty());
+  });
+}
+
 ClusterShardInfo ClusterFamily::GetEmulatedShardInfo(ConnectionContext* cntx) const {
   ClusterShardInfo info{.slot_ranges = SlotRanges({{.start = 0, .end = kMaxSlotNum}}),
                         .master = {},
                         .replicas = {},
                         .migrations = {}};
 
-  optional<Replica::Info> replication_info = server_family_->GetReplicaInfo();
+  optional<Replica::Summary> replication_info = server_family_->GetReplicaSummary();
   ServerState& etl = *ServerState::tlocal();
   if (!replication_info.has_value()) {
     DCHECK(etl.is_master);
-    std::string cluster_announce_ip = absl::GetFlag(FLAGS_cluster_announce_ip);
+    std::string cluster_announce_ip = absl::GetFlag(FLAGS_announce_ip);
     std::string preferred_endpoint =
         cluster_announce_ip.empty() ? cntx->conn()->LocalBindAddress() : cluster_announce_ip;
+    uint16_t cluster_announce_port = absl::GetFlag(FLAGS_announce_port);
+    uint16_t preferred_port = cluster_announce_port == 0
+                                  ? static_cast<uint16_t>(absl::GetFlag(FLAGS_port))
+                                  : cluster_announce_port;
 
-    info.master = {.id = id_,
-                   .ip = preferred_endpoint,
-                   .port = static_cast<uint16_t>(absl::GetFlag(FLAGS_port))};
+    info.master = {.id = id_, .ip = preferred_endpoint, .port = preferred_port};
 
     for (const auto& replica : server_family_->GetDflyCmd()->GetReplicasRoleInfo()) {
       info.replicas.push_back({.id = replica.id,
@@ -369,8 +400,18 @@ void ClusterFamily::Cluster(CmdArgList args, ConnectionContext* cntx) {
     return cntx->SendError(kClusterDisabled);
   }
 
+  if (sub_cmd == "KEYSLOT") {
+    return KeySlot(args, cntx);
+  }
+
+  if (args.size() > 1) {
+    return cntx->SendError(WrongNumArgsError(absl::StrCat("CLUSTER ", sub_cmd)));
+  }
+
   if (sub_cmd == "HELP") {
     return ClusterHelp(cntx);
+  } else if (sub_cmd == "MYID") {
+    return ClusterMyId(cntx);
   } else if (sub_cmd == "SHARDS") {
     return ClusterShards(cntx);
   } else if (sub_cmd == "SLOTS") {
@@ -379,8 +420,6 @@ void ClusterFamily::Cluster(CmdArgList args, ConnectionContext* cntx) {
     return ClusterNodes(cntx);
   } else if (sub_cmd == "INFO") {
     return ClusterInfo(cntx);
-  } else if (sub_cmd == "KEYSLOT") {
-    return KeySlot(args, cntx);
   } else {
     return cntx->SendError(facade::UnknownSubCmd(sub_cmd, "CLUSTER"), facade::kSyntaxErrType);
   }
@@ -401,11 +440,15 @@ void ClusterFamily::ReadWrite(CmdArgList args, ConnectionContext* cntx) {
 }
 
 void ClusterFamily::DflyCluster(CmdArgList args, ConnectionContext* cntx) {
-  if (!IsClusterEnabledOrEmulated()) {
-    return cntx->SendError(kClusterDisabled);
+  if (!(IsClusterEnabled() || (IsClusterEmulated() && cntx->journal_emulated))) {
+    return cntx->SendError("Cluster is disabled. Use --cluster_mode=yes to enable.");
   }
 
-  VLOG(2) << "Got DFLYCLUSTER command (" << cntx->conn()->GetClientId() << "): " << args;
+  if (cntx->conn()) {
+    VLOG(2) << "Got DFLYCLUSTER command (" << cntx->conn()->GetClientId() << "): " << args;
+  } else {
+    VLOG(2) << "Got DFLYCLUSTER command (NO_CLIENT_ID): " << args;
+  }
 
   ToUpper(&args[0]);
   string_view sub_cmd = ArgS(args, 0);
@@ -414,8 +457,6 @@ void ClusterFamily::DflyCluster(CmdArgList args, ConnectionContext* cntx) {
     return DflyClusterGetSlotInfo(args, cntx);
   } else if (sub_cmd == "CONFIG") {
     return DflyClusterConfig(args, cntx);
-  } else if (sub_cmd == "MYID") {
-    return DflyClusterMyId(args, cntx);
   } else if (sub_cmd == "FLUSHSLOTS") {
     return DflyClusterFlushSlots(args, cntx);
   } else if (sub_cmd == "SLOT-MIGRATION-STATUS") {
@@ -425,12 +466,8 @@ void ClusterFamily::DflyCluster(CmdArgList args, ConnectionContext* cntx) {
   return cntx->SendError(UnknownSubCmd(sub_cmd, "DFLYCLUSTER"), kSyntaxErrType);
 }
 
-void ClusterFamily::DflyClusterMyId(CmdArgList args, ConnectionContext* cntx) {
-  if (!args.empty()) {
-    return cntx->SendError(WrongNumArgsError("DFLYCLUSTER MYID"));
-  }
-  auto* rb = static_cast<RedisReplyBuilder*>(cntx->reply_builder());
-  rb->SendBulkString(id_);
+void ClusterFamily::ClusterMyId(ConnectionContext* cntx) {
+  cntx->SendSimpleString(id_);
 }
 
 namespace {
@@ -445,7 +482,7 @@ void DeleteSlots(const SlotRanges& slots_ranges) {
     if (shard == nullptr)
       return;
 
-    shard->db_slice().FlushSlots(slots_ranges);
+    namespaces.GetDefaultNamespace().GetDbSlice(shard->shard_id()).FlushSlots(slots_ranges);
   };
   shard_set->pool()->AwaitFiberOnAll(std::move(cb));
 }
@@ -593,7 +630,7 @@ void ClusterFamily::DflyClusterGetSlotInfo(CmdArgList args, ConnectionContext* c
 
     lock_guard lk(mu);
     for (auto& [slot, data] : slots_stats) {
-      data += shard->db_slice().GetSlotStats(slot);
+      data += namespaces.GetDefaultNamespace().GetDbSlice(shard->shard_id()).GetSlotStats(slot);
     }
   };
 
@@ -695,9 +732,6 @@ void ClusterFamily::DflySlotMigrationStatus(CmdArgList args, ConnectionContext* 
 
   if (reply.empty()) {
     rb->SendSimpleString(StateToStr(MigrationState::C_NO_STATE));
-  } else if (!node_id.empty()) {
-    DCHECK_EQ(reply.size(), 1UL);
-    rb->SendSimpleString(reply[0]);
   } else {
     rb->SendStringArr(reply);
   }
@@ -938,7 +972,7 @@ void ClusterFamily::DflyMigrateAck(CmdArgList args, ConnectionContext* cntx) {
   if (!migration)
     return cntx->SendError(kIdNotFound);
 
-  if (!migration->Join()) {
+  if (!migration->Join(attempt)) {
     return cntx->SendError("Join timeout happened");
   }
 

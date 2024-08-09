@@ -28,8 +28,10 @@ class ClusterFamily {
 
   void Register(CommandRegistry* registry);
 
+  void Shutdown();
+
   // Returns a thread-local pointer.
-  ClusterConfig* cluster_config();
+  static ClusterConfig* cluster_config();
 
   void ApplyMigrationSlotRangeToConfig(std::string_view node_id, const SlotRanges& slots,
                                        bool is_outgoing);
@@ -46,6 +48,7 @@ class ClusterFamily {
   void ClusterSlots(ConnectionContext* cntx);
   void ClusterNodes(ConnectionContext* cntx);
   void ClusterInfo(ConnectionContext* cntx);
+  void ClusterMyId(ConnectionContext* cntx);
 
   void KeySlot(CmdArgList args, ConnectionContext* cntx);
 
@@ -56,7 +59,6 @@ class ClusterFamily {
   void DflyCluster(CmdArgList args, ConnectionContext* cntx);
   void DflyClusterConfig(CmdArgList args, ConnectionContext* cntx);
   void DflyClusterGetSlotInfo(CmdArgList args, ConnectionContext* cntx);
-  void DflyClusterMyId(CmdArgList args, ConnectionContext* cntx);
   void DflyClusterFlushSlots(CmdArgList args, ConnectionContext* cntx);
 
  private:  // Slots migration section

@@ -9,7 +9,9 @@
 
 その他の言語:  [English](README.md) [简体中文](README.zh-CN.md) [한국어](README.ko-KR.md)
 
-[Web サイト](https://www.dragonflydb.io/) • [ドキュメント](https://dragonflydb.io/docs) • [クイックスタート](https://www.dragonflydb.io/docs/getting-started) • [コミュニティ Discord](https://discord.gg/HsPjXGVH85) • [GitHub Discussions](https://github.com/dragonflydb/dragonfly/discussions) | [GitHub Issues](https://github.com/dragonflydb/dragonfly/issues) | [コントリビュート](https://github.com/dragonflydb/dragonfly/blob/main/CONTRIBUTING.md)
+[Web サイト](https://www.dragonflydb.io/) • [ドキュメント](https://dragonflydb.io/docs) • [クイックスタート](https://www.dragonflydb.io/docs/getting-started) • [コミュニティ Discord](https://discord.gg/HsPjXGVH85) • [Dragonfly Forum](https://dragonfly.discourse.group/) • [Join the Dragonfly Community](https://www.dragonflydb.io/community)
+
+[GitHub Discussions](https://github.com/dragonflydb/dragonfly/discussions) • [GitHub Issues](https://github.com/dragonflydb/dragonfly/issues) • [コントリビュート](https://github.com/dragonflydb/dragonfly/blob/main/CONTRIBUTING.md)
 
 ## 世界最速のインメモリデータストア
 
@@ -111,7 +113,7 @@ Dragonfly 特有の議論もある:
  * `admin_bind`: 管理コンソールの TCP 接続を指定されたアドレスにバインドする(`default: any`)。HTTP と RESP の両方のプロトコルをサポートする。
  * `admin_nopass`: 割り当てられたポートで、認証トークンなしでコンソールへのオープン管理アクセスを有効にする (`default: false`)。HTTP と RESP の両方のプロトコルをサポートする。
  * `cluster_mode`: サポートするクラスターモード (`default: ""`)。現在は `emulated` のみをサポートしている。
- * `cluster_announce_ip`: クラスタコマンドがクライアントにアナウンスする IP。
+ * `announce_ip`: クラスタコマンドがクライアントにアナウンスする IP。
 
 ### 一般的なオプションを使用した開始スクリプトの例:
 

@@ -3,6 +3,7 @@
 //
 #pragma once
 
+#include <boost/intrusive/list.hpp>
 #include <memory>
 #include <utility>
 
@@ -34,7 +35,7 @@ class TieredStorage {
   // Min sizes of values taking up full page on their own
   const static size_t kMinOccupancySize = tiering::kPageSize / 2;
 
-  explicit TieredStorage(DbSlice* db_slice, size_t max_size);
+  explicit TieredStorage(size_t max_file_size, DbSlice* db_slice);
   ~TieredStorage();  // drop forward declared unique_ptrs
 
   TieredStorage(TieredStorage&& other) = delete;
@@ -43,6 +44,8 @@ class TieredStorage {
   std::error_code Open(std::string_view path);
   void Close();
 
+  void SetMemoryLowLimit(size_t mem_limit);
+
   // Read offloaded value. It must be of external type
   util::fb2::Future<std::string> Read(DbIndex dbid, std::string_view key, const PrimeValue& value);
 
@@ -50,7 +53,9 @@ class TieredStorage {
   void Read(DbIndex dbid, std::string_view key, const PrimeValue& value,
             std::function<void(const std::string&)> readf);
 
-  // Apply modification to offloaded value, return generic result from callback
+  // Apply modification to offloaded value, return generic result from callback.
+  // Unlike immutable Reads - the modified value must be uploaded back to memory.
+  // This is handled by OpManager when modf completes.
   template <typename T>
   util::fb2::Future<T> Modify(DbIndex dbid, std::string_view key, const PrimeValue& value,
                               std::function<T(std::string*)> modf);
@@ -73,18 +78,42 @@ class TieredStorage {
   // Run offloading loop until i/o device is loaded or all entries were traversed
   void RunOffloading(DbIndex dbid);
 
+  // Prune cool entries to reach the set memory goal with freed memory
+  size_t ReclaimMemory(size_t goal);
+
+  // Returns the primary value, and deletes the cool item as well as its offloaded storage.
+  PrimeValue Warmup(DbIndex dbid, PrimeValue::CoolItem item);
+
+  size_t CoolMemoryUsage() const {
+    return stats_.cool_memory_used;
+  }
+
  private:
   // Returns if a value should be stashed
   bool ShouldStash(const PrimeValue& pv) const;
 
- private:
+  // Moves pv contents to the cool storage and updates pv to point to it.
+  void CoolDown(DbIndex db_ind, std::string_view str, const tiering::DiskSegment& segment,
+                PrimeValue* pv);
+
+  PrimeValue DeleteCool(detail::TieredColdRecord* record);
+  detail::TieredColdRecord* PopCool();
+
   PrimeTable::Cursor offloading_cursor_{};  // where RunOffloading left off
 
   std::unique_ptr<ShardOpManager> op_manager_;
   std::unique_ptr<tiering::SmallBins> bins_;
+  typedef ::boost::intrusive::list<detail::TieredColdRecord> CoolQueue;
+
+  CoolQueue cool_queue_;
+
   unsigned write_depth_limit_ = 10;
   struct {
     uint64_t stash_overflow_cnt = 0;
+    uint64_t total_deletes = 0;
+    uint64_t offloading_steps = 0;
+    uint64_t offloading_stashes = 0;
+    size_t cool_memory_used = 0;
   } stats_;
 };
 
@@ -107,7 +136,7 @@ class TieredStorage {
   // Min sizes of values taking up full page on their own
   const static size_t kMinOccupancySize = tiering::kPageSize / 2;
 
-  explicit TieredStorage(DbSlice* db_slice, size_t max_size) {
+  explicit TieredStorage(size_t max_size, DbSlice* db_slice) {
   }
 
   TieredStorage(TieredStorage&& other) = delete;
@@ -124,6 +153,10 @@ class TieredStorage {
     return {};
   }
 
+  void Read(DbIndex dbid, std::string_view key, const PrimeValue& value,
+            std::function<void(const std::string&)> readf) {
+  }
+
   template <typename T>
   util::fb2::Future<T> Modify(DbIndex dbid, std::string_view key, const PrimeValue& value,
                               std::function<T(std::string*)> modf) {
@@ -133,7 +166,19 @@ class TieredStorage {
   void TryStash(DbIndex dbid, std::string_view key, PrimeValue* value) {
   }
 
-  void Delete(PrimeValue* value) {
+  void Delete(DbIndex dbid, PrimeValue* value) {
+  }
+
+  size_t ReclaimMemory(size_t goal) {
+    return 0;
+  }
+
+  float WriteDepthUsage() const {
+    return 0;
+  }
+
+  size_t CoolMemoryUsage() const {
+    return 0;
   }
 
   void CancelStash(DbIndex dbid, std::string_view key, PrimeValue* value) {
@@ -148,6 +193,10 @@ class TieredStorage {
   }
 
   void RunOffloading(DbIndex dbid) {
+  }
+
+  PrimeValue Warmup(DbIndex dbid, PrimeValue::CoolItem item) {
+    return PrimeValue{};
   }
 };
 

@@ -15,6 +15,8 @@
 #include <string_view>
 #include <vector>
 
+#include "base/logging.h"
+#include "core/compact_object.h"
 #include "facade/facade_types.h"
 #include "facade/op_status.h"
 #include "util/fibers/fibers.h"
@@ -66,11 +68,14 @@ struct TieredStats {
   uint64_t total_cancels = 0;
   uint64_t total_deletes = 0;
   uint64_t total_defrags = 0;
+  uint64_t total_uploads = 0;
   uint64_t total_registered_buf_allocs = 0;
   uint64_t total_heap_buf_allocs = 0;
 
   // How many times the system did not perform Stash call (disjoint with total_stashes).
   uint64_t total_stash_overflows = 0;
+  uint64_t total_offloading_steps = 0;
+  uint64_t total_offloading_stashes = 0;
 
   size_t allocated_bytes = 0;
   size_t capacity_bytes = 0;
@@ -81,6 +86,7 @@ struct TieredStats {
   uint64_t small_bins_cnt = 0;
   uint64_t small_bins_entries_cnt = 0;
   size_t small_bins_filling_bytes = 0;
+  size_t cold_storage_bytes = 0;
 
   TieredStats& operator+=(const TieredStats&);
 };
@@ -118,7 +124,6 @@ inline void ToLower(const MutableSlice* val) {
 
 bool ParseHumanReadableBytes(std::string_view str, int64_t* num_bytes);
 bool ParseDouble(std::string_view src, double* value);
-const char* ObjTypeName(int type);
 
 const char* RdbTypeName(unsigned type);
 
@@ -129,9 +134,6 @@ extern std::atomic_uint64_t rss_mem_current;
 extern std::atomic_uint64_t rss_mem_peak;
 
 extern size_t max_memory_limit;
-
-// malloc memory stats.
-int64_t GetMallocCurrentCommitted();
 
 // version 5.11 maps to 511 etc.
 // set upon server start.
@@ -295,7 +297,7 @@ class Context : protected Cancellation {
 struct ScanOpts {
   std::string_view pattern;
   size_t limit = 10;
-  std::string_view type_filter;
+  std::optional<CompactObjType> type_filter;
   unsigned bucket_id = UINT_MAX;
 
   bool Matches(std::string_view val_name) const;
@@ -357,6 +359,26 @@ class UniquePicksGenerator : public PicksGenerator {
   std::uint32_t remaining_picks_count_;
   std::unordered_set<RandomPick> picked_indexes_;
   absl::BitGen bitgen_{};
+};
+
+struct ConditionFlag {
+  util::fb2::CondVarAny cond_var;
+  bool flag = false;
+};
+
+// Helper class used to guarantee atomicity between serialization of buckets
+class ThreadLocalMutex {
+ public:
+  ThreadLocalMutex();
+  ~ThreadLocalMutex();
+
+  void lock();
+  void unlock();
+
+ private:
+  EngineShard* shard_;
+  util::fb2::CondVarAny cond_var_;
+  bool flag_ = false;
 };
 
 }  // namespace dfly

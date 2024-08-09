@@ -2,7 +2,7 @@ import pytest
 import redis
 from redis import asyncio as aioredis
 from .instance import DflyInstanceFactory
-from .utility import disconnect_clients
+from .utility import *
 import tempfile
 import asyncio
 import os
@@ -323,7 +323,11 @@ async def test_bad_acl_file(df_factory, tmp_dir):
 @pytest.mark.asyncio
 @dfly_args({"port": 1111})
 async def test_good_acl_file(df_factory, tmp_dir):
-    acl = create_temp_file("USER MrFoo ON >mypass", tmp_dir)
+    # The hash below is password temp
+    acl = create_temp_file(
+        "USER MrFoo ON #a6864eb339b0e1f6e00d75293a8840abf069a2c0fe82e6e53af6ac099793c1d5 >mypass",
+        tmp_dir,
+    )
     df = df_factory.create(aclfile=acl)
 
     df.start()
@@ -332,8 +336,16 @@ async def test_good_acl_file(df_factory, tmp_dir):
     await client.execute_command("ACL LOAD")
     result = await client.execute_command("ACL list")
     assert 2 == len(result)
-    assert "user MrFoo on #ea71c25a7a60224 -@all" in result
+    assert (
+        "user MrFoo on #ea71c25a7a60224 #a6864eb339b0e1f -@all" in result
+        or "user MrFoo on #a6864eb339b0e1f #ea71c25a7a60224 -@all" in result
+    )
     assert "user default on nopass ~* +@all" in result
+    await client.execute_command("ACL SETUSER MrFoo +@all")
+    # Check multiple passwords work
+    assert "OK" == await client.execute_command("AUTH mypass")
+    assert "OK" == await client.execute_command("AUTH temp")
+    assert "OK" == await client.execute_command("AUTH default")
     await client.execute_command("ACL DELUSER MrFoo")
 
     await client.execute_command("ACL SETUSER roy ON >mypass +@string +hset")
@@ -446,6 +458,23 @@ async def test_require_pass(df_factory):
 
 
 @pytest.mark.asyncio
+@dfly_args({"port": 1111, "requirepass": "temp"})
+async def test_require_pass_with_acl_file_order(df_factory, tmp_dir):
+    acl = create_temp_file(
+        "USER default ON >jordan ~* +@all",
+        tmp_dir,
+    )
+
+    df = df_factory.create(aclfile=acl)
+    df.start()
+
+    client = aioredis.Redis(username="default", password="jordan", port=df.port)
+
+    assert await client.set("foo", "bar")
+    await client.close()
+
+
+@pytest.mark.asyncio
 async def test_set_acl_file(async_client: aioredis.Redis, tmp_dir):
     acl_file_content = "USER roy ON #ea71c25a7a602246b4c39824b855678894a96f43bb9b71319c39700a1e045222 +@string +@fast +hset\nUSER john on nopass +@string"
 
@@ -536,6 +565,43 @@ async def test_acl_keys(async_client):
     # reject because bonus key does not match
     with pytest.raises(redis.exceptions.ResponseError):
         await async_client.execute_command("ZUNIONSTORE destkey 2 barz1 barz2")
+
+
+@pytest.mark.asyncio
+async def test_namespaces(df_factory):
+    df = df_factory.create()
+    df.start()
+
+    admin = aioredis.Redis(port=df.port)
+    assert await admin.execute_command("SET foo admin") == b"OK"
+    assert await admin.execute_command("GET foo") == b"admin"
+
+    # Create ns space named 'ns1'
+    await admin.execute_command("ACL SETUSER adi NAMESPACE:ns1 ON >adi_pass +@all ~*")
+
+    adi = aioredis.Redis(port=df.port)
+    assert await adi.execute_command("AUTH adi adi_pass") == b"OK"
+    assert await adi.execute_command("SET foo bar") == b"OK"
+    assert await adi.execute_command("GET foo") == b"bar"
+    assert await admin.execute_command("GET foo") == b"admin"
+
+    # Adi and Shahar are on the same team
+    await admin.execute_command("ACL SETUSER shahar NAMESPACE:ns1 ON >shahar_pass +@all ~*")
+
+    shahar = aioredis.Redis(port=df.port)
+    assert await shahar.execute_command("AUTH shahar shahar_pass") == b"OK"
+    assert await shahar.execute_command("GET foo") == b"bar"
+    assert await shahar.execute_command("SET foo bar2") == b"OK"
+    assert await adi.execute_command("GET foo") == b"bar2"
+
+    # Roman is a CTO, he has his own private space
+    await admin.execute_command("ACL SETUSER roman NAMESPACE:ns2 ON >roman_pass +@all ~*")
+
+    roman = aioredis.Redis(port=df.port)
+    assert await roman.execute_command("AUTH roman roman_pass") == b"OK"
+    assert await roman.execute_command("GET foo") == None
+
+    await close_clients(admin, adi, shahar, roman)
 
 
 @pytest.mark.asyncio

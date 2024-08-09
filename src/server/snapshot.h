@@ -1,4 +1,4 @@
-// Copyright 2022, DragonflyDB authors.  All rights reserved.
+// Copyright 2024, DragonflyDB authors.  All rights reserved.
 // See LICENSE for licensing terms.
 //
 
@@ -10,6 +10,7 @@
 #include "base/pod_array.h"
 #include "core/size_tracking_channel.h"
 #include "io/file.h"
+#include "server/common.h"
 #include "server/db_slice.h"
 #include "server/rdb_save.h"
 #include "server/table.h"
@@ -66,7 +67,10 @@ class SliceSnapshot {
 
   // Initialize snapshot, start bucket iteration fiber, register listeners.
   // In journal streaming mode it needs to be stopped by either Stop or Cancel.
-  void Start(bool stream_journal, const Cancellation* cll);
+  enum class SnapshotFlush { kAllow, kDisallow };
+
+  void Start(bool stream_journal, const Cancellation* cll,
+             SnapshotFlush allow_flush = SnapshotFlush::kDisallow);
 
   // Initialize a snapshot that sends only the missing journal updates
   // since start_lsn and then registers a callback switches into the
@@ -115,6 +119,10 @@ class SliceSnapshot {
   // Push regardless of buffer size if force is true.
   // Return if pushed.
   bool PushSerializedToChannel(bool force);
+
+  // Helper function that flushes the serialized items into the RecordStream
+  using FlushState = SerializerBase::FlushState;
+  size_t Serialize(FlushState flush_state = FlushState::kFlushMidEntry);
 
  public:
   uint64_t snapshot_version() const {

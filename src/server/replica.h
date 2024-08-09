@@ -74,10 +74,6 @@ class Replica : ProtocolClient {
 
   std::error_code TakeOver(std::string_view timeout, bool save_flag);
 
-  std::string_view MasterId() const {
-    return master_context_.master_repl_id;
-  }
-
  private: /* Main standalone mode functions */
   // Coordinate state transitions. Spawned by start.
   void MainReplicationFb();
@@ -104,8 +100,6 @@ class Replica : ProtocolClient {
   // Send DFLY ${kind} to the master instance.
   std::error_code SendNextPhaseRequest(std::string_view kind);
 
-  void AclCheckFb();
-
  private: /* Utility */
   struct PSyncResponse {
     // string - end of sync token (diskless)
@@ -117,7 +111,7 @@ class Replica : ProtocolClient {
   std::error_code ParseReplicationHeader(base::IoBuf* io_buf, PSyncResponse* dest);
 
  public: /* Utility */
-  struct Info {
+  struct Summary {
     std::string host;
     uint16_t port;
     bool master_link_established;
@@ -127,18 +121,10 @@ class Replica : ProtocolClient {
     std::string master_id;
   };
 
-  Info GetInfo() const;  // thread-safe, blocks fiber
+  Summary GetSummary() const;  // thread-safe, blocks fiber
 
   bool HasDflyMaster() const {
     return !master_context_.dfly_session_id.empty();
-  }
-
-  const std::string& MasterHost() const {
-    return server().host;
-  }
-
-  uint16_t Port() const {
-    return server().port;
   }
 
   std::vector<uint64_t> GetReplicaOffset() const;
@@ -208,6 +194,8 @@ class DflyShardReplica : public ProtocolClient {
   uint32_t FlowId() const;
 
   uint64_t JournalExecutedCount() const;
+
+  void Pause(bool pause);
 
  private:
   Service& service_;

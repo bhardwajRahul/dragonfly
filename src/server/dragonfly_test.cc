@@ -362,6 +362,17 @@ TEST_F(DflyEngineTest, MemcacheFlags) {
   ASSERT_EQ(resp, "OK");
   MCResponse resp2 = RunMC(MP::GET, "key");
   EXPECT_THAT(resp2, ElementsAre("VALUE key 42 3", "bar", "END"));
+
+  ASSERT_EQ(Run("resp", {"flushdb"}), "OK");
+  pp_->AwaitFiberOnAll([](auto*) {
+    if (auto* shard = EngineShard::tlocal(); shard) {
+      EXPECT_EQ(namespaces.GetDefaultNamespace()
+                    .GetDbSlice(shard->shard_id())
+                    .GetDBTable(0)
+                    ->mcflag.size(),
+                0u);
+    }
+  });
 }
 
 TEST_F(DflyEngineTest, LimitMemory) {
@@ -391,7 +402,6 @@ TEST_F(DflyEngineTest, FlushAll) {
 }
 
 TEST_F(DflyEngineTest, OOM) {
-  shard_set->TEST_EnableHeartBeat();
   max_memory_limit = 300000;
   size_t i = 0;
   RespExpr resp;
@@ -433,7 +443,6 @@ TEST_F(DflyEngineTest, OOM) {
 /// and then written with the same key.
 TEST_F(DflyEngineTest, Bug207) {
   max_memory_limit = 300000;
-  shard_set->TEST_EnableHeartBeat();
   shard_set->TEST_EnableCacheMode();
   absl::FlagSaver fs;
   absl::SetFlag(&FLAGS_oom_deny_ratio, 4);
@@ -463,7 +472,6 @@ TEST_F(DflyEngineTest, Bug207) {
 }
 
 TEST_F(DflyEngineTest, StickyEviction) {
-  shard_set->TEST_EnableHeartBeat();
   shard_set->TEST_EnableCacheMode();
   absl::FlagSaver fs;
   absl::SetFlag(&FLAGS_oom_deny_ratio, 4);
@@ -563,21 +571,17 @@ TEST_F(DflyEngineTest, Bug468) {
   resp = Run({"exec"});
   ASSERT_THAT(resp, ErrArg("not an integer"));
 
-  ASSERT_FALSE(service_->IsLocked(0, "foo"));
+  ASSERT_FALSE(IsLocked(0, "foo"));
 
   resp = Run({"eval", "return redis.call('set', 'foo', 'bar', 'EX', 'moo')", "1", "foo"});
   ASSERT_THAT(resp, ErrArg("not an integer"));
 
-  ASSERT_FALSE(service_->IsLocked(0, "foo"));
+  ASSERT_FALSE(IsLocked(0, "foo"));
 }
 
 TEST_F(DflyEngineTest, Bug496) {
-  shard_set->pool()->AwaitFiberOnAll([&](unsigned index, ProactorBase* base) {
-    EngineShard* shard = EngineShard::tlocal();
-    if (shard == nullptr)
-      return;
-
-    auto& db = shard->db_slice();
+  shard_set->RunBlockingInParallel([](EngineShard* shard) {
+    auto& db = namespaces.GetDefaultNamespace().GetDbSlice(shard->shard_id());
 
     int cb_hits = 0;
     uint32_t cb_id =

@@ -24,6 +24,7 @@
 #include "server/server_family.h"
 #include "server/server_state.h"
 #include "server/snapshot.h"
+#include "server/transaction.h"
 
 using namespace std;
 using namespace facade;
@@ -100,9 +101,12 @@ void MemoryCmd::Run(CmdArgList args) {
         "    Shows breakdown of memory.",
         "MALLOC-STATS",
         "    Show global malloc stats as provided by allocator libraries",
-        "ARENA [BACKING] [thread-id]",
+        "ARENA BACKING] [thread-id]",
         "    Show mimalloc arena stats for a heap residing in specified thread-id. 0 by default.",
         "    If BACKING is specified, show stats for the backing heap.",
+        "ARENA SHOW",
+        "    Prints the arena summary report for the entire process.",
+        "    Requires MIMALLOC_VERBOSE=1 environment to be set. The output goes to stdout",
         "USAGE <key>",
         "    Show memory usage of a key.",
         "DECOMMIT",
@@ -161,7 +165,7 @@ void MemoryCmd::Run(CmdArgList args) {
   }
 
   if (sub_cmd == "DEFRAGMENT") {
-    shard_set->pool()->DispatchOnAll([this](util::ProactorBase*) {
+    shard_set->pool()->DispatchOnAll([](util::ProactorBase*) {
       if (auto* shard = EngineShard::tlocal(); shard)
         shard->ForceDefrag();
     });
@@ -241,26 +245,15 @@ void PushMemoryUsageStats(const base::IoBuf::MemoryUsage& mem, string_view prefi
 void MemoryCmd::Stats() {
   vector<pair<string, size_t>> stats;
   stats.reserve(25);
-  auto server_metrics = owner_->GetMetrics();
-
-  // RSS
-  stats.push_back({"rss_bytes", rss_mem_current.load(memory_order_relaxed)});
-  stats.push_back({"rss_peak_bytes", rss_mem_peak.load(memory_order_relaxed)});
-
-  // Used by DbShards and DashTable
-  stats.push_back({"data_bytes", used_mem_current.load(memory_order_relaxed)});
-  stats.push_back({"data_peak_bytes", used_mem_peak.load(memory_order_relaxed)});
-
   ConnectionMemoryUsage connection_memory = GetConnectionMemoryUsage(owner_);
 
   // Connection stats, excluding replication connections
   stats.push_back({"connections.count", connection_memory.connection_count});
   stats.push_back({"connections.direct_bytes", connection_memory.connection_size});
-  PushMemoryUsageStats(connection_memory.connections_memory, "connections",
-                       connection_memory.connections_memory.GetTotalSize() +
-                           connection_memory.pipelined_bytes + connection_memory.connection_size,
-                       &stats);
-  stats.push_back({"connections.pipeline_bytes", connection_memory.pipelined_bytes});
+  PushMemoryUsageStats(
+      connection_memory.connections_memory, "connections",
+      connection_memory.connections_memory.GetTotalSize() + connection_memory.connection_size,
+      &stats);
 
   // Replication connection stats
   stats.push_back(
@@ -270,17 +263,6 @@ void MemoryCmd::Stats() {
                        connection_memory.replication_memory.GetTotalSize() +
                            connection_memory.replication_connection_size,
                        &stats);
-
-  atomic<size_t> serialization_memory = 0;
-  atomic<size_t> tls_memory = 0;
-  shard_set->pool()->AwaitFiberOnAll([&](auto*) {
-    serialization_memory.fetch_add(SliceSnapshot::GetThreadLocalMemoryUsage());
-    tls_memory.fetch_add(Listener::TLSUsedMemoryThreadLocal());
-  });
-
-  // Serialization stats, including both replication-related serialization and saving to RDB files.
-  stats.push_back({"serialization", serialization_memory.load()});
-  stats.push_back({"tls", tls_memory.load()});
 
   auto* rb = static_cast<RedisReplyBuilder*>(cntx_->reply_builder());
   rb->StartCollection(stats.size(), RedisReplyBuilder::MAP);
@@ -321,18 +303,30 @@ void MemoryCmd::MallocStats() {
 void MemoryCmd::ArenaStats(CmdArgList args) {
   uint32_t tid = 0;
   bool backing = false;
+  bool show_arenas = false;
   if (args.size() >= 2) {
     ToUpper(&args[1]);
 
-    unsigned tid_indx = 1;
-    if (ArgS(args, tid_indx) == "BACKING") {
-      ++tid_indx;
-      backing = true;
-    }
+    if (ArgS(args, 1) == "SHOW") {
+      if (args.size() != 2)
+        return cntx_->SendError(kSyntaxErr, kSyntaxErrType);
+      show_arenas = true;
+    } else {
+      unsigned tid_indx = 1;
 
-    if (args.size() > tid_indx && !absl::SimpleAtoi(ArgS(args, tid_indx), &tid)) {
-      return cntx_->SendError(kInvalidIntErr);
+      if (ArgS(args, tid_indx) == "BACKING") {
+        ++tid_indx;
+        backing = true;
+      }
+      if (args.size() > tid_indx && !absl::SimpleAtoi(ArgS(args, tid_indx), &tid)) {
+        return cntx_->SendError(kInvalidIntErr);
+      }
     }
+  }
+
+  if (show_arenas) {
+    mi_debug_show_arenas(true, true, true);
+    return cntx_->reply_builder()->SendOk();
   }
 
   if (backing && tid >= shard_set->pool()->size()) {
@@ -353,8 +347,8 @@ void MemoryCmd::ArenaStats(CmdArgList args) {
 
 void MemoryCmd::Usage(std::string_view key) {
   ShardId sid = Shard(key, shard_set->size());
-  ssize_t memory_usage = shard_set->pool()->at(sid)->AwaitBrief([key, this]() -> ssize_t {
-    auto& db_slice = EngineShard::tlocal()->db_slice();
+  ssize_t memory_usage = shard_set->pool()->at(sid)->AwaitBrief([key, this, sid]() -> ssize_t {
+    auto& db_slice = cntx_->ns->GetDbSlice(sid);
     auto [pt, exp_t] = db_slice.GetTables(cntx_->db_index());
     PrimeIterator it = pt->Find(key);
     if (IsValid(it)) {

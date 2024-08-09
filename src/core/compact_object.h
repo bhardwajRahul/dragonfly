@@ -1,4 +1,4 @@
-// Copyright 2022, DragonflyDB authors.  All rights reserved.
+// Copyright 2024, DragonflyDB authors.  All rights reserved.
 // See LICENSE for licensing terms.
 //
 
@@ -6,12 +6,14 @@
 
 #include <absl/base/internal/endian.h>
 
+#include <boost/intrusive/list_hook.hpp>
 #include <optional>
 #include <type_traits>
 
 #include "base/pmr/memory_resource.h"
 #include "core/json/json_object.h"
 #include "core/small_string.h"
+#include "core/string_or_view.h"
 
 namespace dfly {
 
@@ -91,7 +93,13 @@ class RobjWrapper {
 
 } __attribute__((packed));
 
+struct TieredColdRecord;
+
 }  // namespace detail
+
+using CompactObjType = unsigned;
+
+constexpr CompactObjType kInvalidCompactObjType = std::numeric_limits<CompactObjType>::max();
 
 class CompactObj {
   static constexpr unsigned kInlineLen = 16;
@@ -237,13 +245,13 @@ class CompactObj {
     }
   }
 
-  bool HasIoPending() const {
+  bool DefragIfNeeded(float ratio);
+
+  bool HasStashPending() const {
     return mask_ & IO_PENDING;
   }
 
-  bool DefragIfNeeded(float ratio);
-
-  void SetIoPending(bool b) {
+  void SetStashPending(bool b) {
     if (b) {
       mask_ |= IO_PENDING;
     } else {
@@ -264,9 +272,7 @@ class CompactObj {
   }
 
   unsigned Encoding() const;
-  unsigned ObjType() const;
-
-  static std::string_view ObjTypeToString(unsigned type);
+  CompactObjType ObjType() const;
 
   void* RObjPtr() const {
     return u_.r_obj.inner_obj();
@@ -278,7 +284,7 @@ class CompactObj {
 
   // takes ownership over obj_inner.
   // type should not be OBJ_STRING.
-  void InitRobj(unsigned type, unsigned encoding, void* obj_inner);
+  void InitRobj(CompactObjType type, unsigned encoding, void* obj_inner);
 
   // For STR object.
   void SetInt(int64_t val);
@@ -322,8 +328,30 @@ class CompactObj {
     return taglen_ == EXTERNAL_TAG;
   }
 
-  void SetExternal(size_t offset, size_t sz);
+  bool IsCool() const {
+    assert(IsExternal());
+    return u_.ext_ptr.is_cool;
+  }
+
+  void SetExternal(size_t offset, uint32_t sz);
+  void SetCool(size_t offset, uint32_t serialized_size, detail::TieredColdRecord* record);
+
+  struct CoolItem {
+    uint16_t page_offset;
+    size_t serialized_size;
+    detail::TieredColdRecord* record;
+  };
+  CoolItem GetCool() const;
+
+  void ImportExternal(const CompactObj& src);
+
   std::pair<size_t, size_t> GetExternalSlice() const;
+
+  // Injects either the the raw string (extracted with GetRawString()) or the usual string
+  // back to the compact object. In the latter case, encoding is performed.
+  // Precondition: The object must be in the EXTERNAL state.
+  // Postcondition: The object is an in-memory string.
+  void Materialize(std::string_view str, bool is_raw);
 
   // In case this object a single blob, returns number of bytes allocated on heap
   // for that blob. Otherwise returns 0.
@@ -349,22 +377,12 @@ class CompactObj {
   static void InitThreadLocal(MemoryResource* mr);
   static MemoryResource* memory_resource();  // thread-local.
 
-  template <typename T>
-  inline static constexpr bool IsConstructibleFromMR =
-      std::is_constructible_v<T, decltype(memory_resource())>;
-
-  template <typename T> static std::enable_if_t<IsConstructibleFromMR<T>, T*> AllocateMR() {
+  template <typename T, typename... Args> static T* AllocateMR(Args&&... args) {
     void* ptr = memory_resource()->allocate(sizeof(T), alignof(T));
-    return new (ptr) T{memory_resource()};
-  }
-
-  template <typename T, typename... Args>
-  inline static constexpr bool IsConstructibleFromArgs = std::is_constructible_v<T, Args...>;
-
-  template <typename T, typename... Args>
-  static std::enable_if_t<IsConstructibleFromArgs<T, Args...>, T*> AllocateMR(Args&&... args) {
-    void* ptr = memory_resource()->allocate(sizeof(T), alignof(T));
-    return new (ptr) T{std::forward<Args&&>(args)...};
+    if constexpr (std::is_constructible_v<T, decltype(memory_resource())> && sizeof...(args) == 0)
+      return new (ptr) T{memory_resource()};
+    else
+      return new (ptr) T{std::forward<Args>(args)...};
   }
 
   template <typename T> static void DeleteMR(void* ptr) {
@@ -373,15 +391,21 @@ class CompactObj {
     memory_resource()->deallocate(ptr, sizeof(T), alignof(T));
   }
 
+  // returns raw (non-decoded) string together with the encoding mask.
+  // Used to bypass decoding layer.
+  // Precondition: the object is a non-inline string.
+  StringOrView GetRawString() const;
+
+  bool HasAllocated() const;
+
  private:
+  void EncodeString(std::string_view str);
   size_t DecodedLen(size_t sz) const;
 
   bool EqualNonInline(std::string_view sv) const;
 
   // Requires: HasAllocated() - true.
   void Free();
-
-  bool HasAllocated() const;
 
   bool CmpEncoded(std::string_view sv) const;
 
@@ -395,13 +419,24 @@ class CompactObj {
     mask_ = mask;
   }
 
+  // Must be 16 bytes.
   struct ExternalPtr {
-    uint32_t type : 8;
-    uint32_t reserved : 24;
-    uint32_t page_index;
+    uint32_t serialized_size;
     uint16_t page_offset;  // 0 for multi-page blobs. != 0 for small blobs.
-    uint16_t reserved2;
-    uint32_t size;
+    uint16_t is_cool : 1;
+    uint16_t is_reserved : 15;
+
+    // We do not have enough space in the common area to store page_index together with
+    // cool_record pointer. Therefore, we moved this field into TieredColdRecord itself.
+    struct Offload {
+      uint32_t page_index;
+      uint32_t reserved;
+    };
+
+    union {
+      Offload offload;
+      detail::TieredColdRecord* cool_record;
+    };
   } __attribute__((packed));
 
   struct JsonWrapper {
@@ -436,7 +471,7 @@ class CompactObj {
   //
   static_assert(sizeof(u_) == 16, "");
 
-  mutable uint8_t mask_ = 0;
+  uint8_t mask_ = 0;
 
   // We currently reserve 5 bits for tags and 3 bits for extending the mask. currently reserved.
   uint8_t taglen_ = 0;
@@ -492,6 +527,23 @@ class CompactObjectView {
  private:
   CompactObj obj_;
 };
+
+std::string_view ObjTypeToString(CompactObjType type);
+
+std::optional<CompactObjType> ObjTypeFromString(std::string_view sv);
+
+namespace detail {
+
+struct TieredColdRecord : public ::boost::intrusive::list_base_hook<
+                              boost::intrusive::link_mode<boost::intrusive::normal_link>> {
+  uint64_t key_hash;  // Allows searching the entry in the dbslice.
+  CompactObj value;
+  uint16_t db_index;
+  uint32_t page_index;
+};
+static_assert(sizeof(TieredColdRecord) == 48);
+
+};  // namespace detail
 
 }  // namespace dfly
 

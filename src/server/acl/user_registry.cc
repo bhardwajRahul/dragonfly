@@ -21,7 +21,7 @@ namespace dfly::acl {
 void UserRegistry::MaybeAddAndUpdate(std::string_view username, User::UpdateRequest req) {
   std::unique_lock<fb2::SharedMutex> lock(mu_);
   auto& user = registry_[username];
-  user.Update(std::move(req));
+  user.Update(std::move(req), *cat_to_id_table_, *reverse_cat_table_, *cat_to_commands_table_);
 }
 
 bool UserRegistry::RemoveUser(std::string_view username) {
@@ -35,7 +35,8 @@ UserCredentials UserRegistry::GetCredentials(std::string_view username) const {
   if (it == registry_.end()) {
     return {};
   }
-  return {it->second.AclCategory(), it->second.AclCommands(), it->second.Keys()};
+  return {it->second.AclCategory(), it->second.AclCommands(), it->second.Keys(),
+          it->second.Namespace()};
 }
 
 bool UserRegistry::IsUserActive(std::string_view username) const {
@@ -73,17 +74,25 @@ UserRegistry::UserWithWriteLock::UserWithWriteLock(std::unique_lock<fb2::SharedM
 }
 
 User::UpdateRequest UserRegistry::DefaultUserUpdateRequest() const {
-  std::pair<User::Sign, uint32_t> acl{User::Sign::PLUS, acl::ALL};
-  auto key = User::UpdateKey{"~*", KeyOp::READ_WRITE, true, false};
-  auto pass = std::vector<User::UpdatePass>{{"", false, true}};
-  return {std::move(pass), true, false, {std::move(acl)}, {std::move(key)}};
+  // Assign field by field to supress an annoying compiler warning
+  User::UpdateRequest req;
+  req.passwords = std::vector<User::UpdatePass>{{"", false, true}};
+  req.is_active = true;
+  req.updates = {std::pair<User::Sign, uint32_t>{User::Sign::PLUS, acl::ALL}};
+  req.keys = {User::UpdateKey{"~*", KeyOp::READ_WRITE, true, false}};
+  return req;
 }
 
-void UserRegistry::Init() {
+void UserRegistry::Init(const CategoryToIdxStore* cat_to_id_table,
+                        const ReverseCategoryIndexTable* reverse_cat_table,
+                        const CategoryToCommandsIndexStore* cat_to_commands_table) {
   // if there exists an acl file to load from, requirepass
   // will not overwrite the default's user password loaded from
   // that file. Loading the default's user password from a file
   // has higher priority than the deprecated flag
+  cat_to_id_table_ = cat_to_id_table;
+  reverse_cat_table_ = reverse_cat_table;
+  cat_to_commands_table_ = cat_to_commands_table;
   auto default_user = DefaultUserUpdateRequest();
   auto maybe_password = absl::GetFlag(FLAGS_requirepass);
   if (!maybe_password.empty()) {

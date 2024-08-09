@@ -33,6 +33,7 @@
 using namespace std;
 
 ABSL_DECLARE_FLAG(bool, info_replication_valkey_compatible);
+ABSL_DECLARE_FLAG(uint32_t, replication_timeout);
 
 namespace dfly {
 
@@ -71,59 +72,60 @@ std::string_view SyncStateName(DflyCmd::SyncState sync_state) {
   return "unsupported";
 }
 
-struct TransactionGuard {
-  static OpStatus ExitGuardCb(Transaction* t, EngineShard* shard) {
-    shard->db_slice().SetExpireAllowed(true);
-    return OpStatus::OK;
-  };
-
-  explicit TransactionGuard(Transaction* t, bool disable_expirations = false) : t(t) {
-    t->Execute(
-        [disable_expirations](Transaction* t, EngineShard* shard) {
-          if (disable_expirations) {
-            shard->db_slice().SetExpireAllowed(!disable_expirations);
-          }
-          return OpStatus::OK;
-        },
-        false);
-    VLOG(2) << "Transaction guard engaged";
-  }
-
-  ~TransactionGuard() {
-    VLOG(2) << "Releasing transaction guard";
-    t->Execute(ExitGuardCb, true);
-  }
-
-  Transaction* t;
-};
-
-OpStatus WaitReplicaFlowToCatchup(absl::Time end_time, shared_ptr<DflyCmd::ReplicaInfo> replica,
-                                  EngineShard* shard) {
+bool WaitReplicaFlowToCatchup(absl::Time end_time, const DflyCmd::ReplicaInfo* replica,
+                              EngineShard* shard) {
   // We don't want any writes to the journal after we send the `PING`,
   // and expirations could ruin that.
-  shard->db_slice().SetExpireAllowed(false);
+  namespaces.GetDefaultNamespace().GetDbSlice(shard->shard_id()).SetExpireAllowed(false);
   shard->journal()->RecordEntry(0, journal::Op::PING, 0, 0, nullopt, {}, true);
 
-  FlowInfo* flow = &replica->flows[shard->shard_id()];
+  const FlowInfo* flow = &replica->flows[shard->shard_id()];
   while (flow->last_acked_lsn < shard->journal()->GetLsn()) {
     if (absl::Now() > end_time) {
       LOG(WARNING) << "Couldn't synchronize with replica for takeover in time: " << replica->address
                    << ":" << replica->listening_port << ", last acked: " << flow->last_acked_lsn
                    << ", expecting " << shard->journal()->GetLsn();
-      return OpStatus::TIMED_OUT;
+      return false;
     }
     if (replica->cntx.IsCancelled()) {
-      return OpStatus::CANCELLED;
+      return false;
     }
     VLOG(1) << "Replica lsn:" << flow->last_acked_lsn
             << " master lsn:" << shard->journal()->GetLsn();
     ThisFiber::SleepFor(1ms);
   }
 
-  return OpStatus::OK;
+  return true;
 }
 
 }  // namespace
+
+void DflyCmd::ReplicaInfo::Cancel() {
+  lock_guard lk = GetExclusiveLock();
+  if (replica_state == SyncState::CANCELLED) {
+    return;
+  }
+
+  LOG(INFO) << "Disconnecting from replica " << address << ":" << listening_port;
+
+  // Update state and cancel context.
+  replica_state = SyncState::CANCELLED;
+  cntx.Cancel();
+
+  // Wait for tasks to finish.
+  shard_set->RunBlockingInParallel([this](EngineShard* shard) {
+    FlowInfo* flow = &flows[shard->shard_id()];
+    if (flow->cleanup) {
+      flow->cleanup();
+    }
+
+    flow->full_sync_fb.JoinIfNeeded();
+    flow->conn = nullptr;
+  });
+
+  // Wait for error handler to quit.
+  cntx.JoinErrorHandler();
+}
 
 DflyCmd::DflyCmd(ServerFamily* server_family) : sf_(server_family) {
 }
@@ -234,23 +236,27 @@ void DflyCmd::Flow(CmdArgList args, ConnectionContext* cntx) {
   if (!sync_id)
     return;
 
-  unique_lock lk(replica_ptr->mu);
-  if (replica_ptr->replica_state != SyncState::PREPARATION)
-    return cntx->SendError(kInvalidState);
+  string eof_token;
+  {
+    lock_guard lk = replica_ptr->GetExclusiveLock();
 
-  // Set meta info on connection.
-  cntx->conn()->SetName(absl::StrCat("repl_flow_", sync_id));
-  cntx->conn_state.replication_info.repl_session_id = sync_id;
-  cntx->conn_state.replication_info.repl_flow_id = flow_id;
+    if (replica_ptr->replica_state != SyncState::PREPARATION)
+      return cntx->SendError(kInvalidState);
 
-  absl::InsecureBitGen gen;
-  string eof_token = GetRandomHex(gen, 40);
+    // Set meta info on connection.
+    cntx->conn()->SetName(absl::StrCat("repl_flow_", sync_id));
+    cntx->conn_state.replication_info.repl_session_id = sync_id;
+    cntx->conn_state.replication_info.repl_flow_id = flow_id;
 
-  auto& flow = replica_ptr->flows[flow_id];
-  cntx->replication_flow = &flow;
-  flow.conn = cntx->conn();
-  flow.eof_token = eof_token;
-  flow.version = replica_ptr->version;
+    absl::InsecureBitGen gen;
+    eof_token = GetRandomHex(gen, 40);
+
+    auto& flow = replica_ptr->flows[flow_id];
+    cntx->replication_flow = &flow;
+    flow.conn = cntx->conn();
+    flow.eof_token = eof_token;
+    flow.version = replica_ptr->version;
+  }
   if (!cntx->conn()->Migrate(shard_set->pool()->at(flow_id))) {
     // Listener::PreShutdown() triggered
     if (cntx->conn()->socket()->IsOpen()) {
@@ -260,7 +266,9 @@ void DflyCmd::Flow(CmdArgList args, ConnectionContext* cntx) {
   }
   sf_->journal()->StartInThread();
 
-  std::string_view sync_type = "FULL";
+  std::string_view sync_type{"FULL"};
+
+#if 0  // Partial synchronization is disabled
   if (seqid.has_value()) {
     if (sf_->journal()->IsLSNInBuffer(*seqid) || sf_->journal()->GetLsn() == *seqid) {
       // This does not guarantee the lsn will still be present when DFLY SYNC runs,
@@ -277,6 +285,7 @@ void DflyCmd::Flow(CmdArgList args, ConnectionContext* cntx) {
                    "--shard_repl_backlog_len option";
     }
   }
+#endif
 
   rb->StartArray(2);
   rb->SendSimpleString(sync_type);
@@ -293,13 +302,13 @@ void DflyCmd::Sync(CmdArgList args, ConnectionContext* cntx) {
   if (!sync_id)
     return;
 
-  unique_lock lk(replica_ptr->mu);
+  lock_guard lk = replica_ptr->GetExclusiveLock();
   if (!CheckReplicaStateOrReply(*replica_ptr, SyncState::PREPARATION, rb))
     return;
 
   // Start full sync.
   {
-    TransactionGuard tg{cntx->transaction};
+    Transaction::Guard tg{cntx->transaction};
     AggregateStatus status;
 
     // Use explicit assignment for replica_ptr, because capturing structured bindings is C++20.
@@ -332,12 +341,12 @@ void DflyCmd::StartStable(CmdArgList args, ConnectionContext* cntx) {
   if (!sync_id)
     return;
 
-  unique_lock lk(replica_ptr->mu);
+  lock_guard lk = replica_ptr->GetExclusiveLock();
   if (!CheckReplicaStateOrReply(*replica_ptr, SyncState::FULL_SYNC, rb))
     return;
 
   {
-    TransactionGuard tg{cntx->transaction};
+    Transaction::Guard tg{cntx->transaction};
     AggregateStatus status;
 
     auto cb = [this, &status, replica_ptr = replica_ptr](EngineShard* shard) {
@@ -385,14 +394,19 @@ void DflyCmd::TakeOver(CmdArgList args, ConnectionContext* cntx) {
   if (!sync_id)
     return;
 
-  unique_lock lk(replica_ptr->mu);
-  if (!CheckReplicaStateOrReply(*replica_ptr, SyncState::STABLE_SYNC, rb))
-    return;
+  {
+    shared_lock lk = replica_ptr->GetSharedLock();
+    if (!CheckReplicaStateOrReply(*replica_ptr, SyncState::STABLE_SYNC, rb))
+      return;
+
+    auto new_state = sf_->service().SwitchState(GlobalState::ACTIVE, GlobalState::TAKEN_OVER);
+    if (new_state != GlobalState::TAKEN_OVER) {
+      LOG(WARNING) << new_state << " in progress, could not take over";
+      return cntx->SendError("Takeover failed!");
+    }
+  }
 
   LOG(INFO) << "Takeover initiated, locking down the database.";
-
-  sf_->service().SwitchState(GlobalState::ACTIVE, GlobalState::TAKEN_OVER);
-
   absl::Duration timeout_dur = absl::Seconds(timeout);
   absl::Time end_time = absl::Now() + timeout_dur;
   AggregateStatus status;
@@ -421,23 +435,32 @@ void DflyCmd::TakeOver(CmdArgList args, ConnectionContext* cntx) {
 
   VLOG(1) << "AwaitCurrentDispatches done";
 
-  absl::Cleanup([] {
-    shard_set->RunBriefInParallel(
-        [](EngineShard* shard) { shard->db_slice().SetExpireAllowed(true); });
-    VLOG(2) << "Enable expiration";
+  absl::Cleanup cleanup([] {
+    VLOG(2) << "Enabling expiration";
+    shard_set->RunBriefInParallel([](EngineShard* shard) {
+      namespaces.GetDefaultNamespace().GetDbSlice(shard->shard_id()).SetExpireAllowed(true);
+    });
   });
 
+  atomic_bool catchup_success = true;
   if (*status == OpStatus::OK) {
-    auto cb = [replica_ptr = std::move(replica_ptr), end_time, &status](EngineShard* shard) {
-      status = WaitReplicaFlowToCatchup(end_time, std::move(replica_ptr), shard);
+    shared_lock lk = replica_ptr->GetSharedLock();
+    auto cb = [replica_ptr = std::move(replica_ptr), end_time,
+               &catchup_success](EngineShard* shard) {
+      if (!WaitReplicaFlowToCatchup(end_time, replica_ptr.get(), shard)) {
+        catchup_success.store(false);
+      }
     };
     shard_set->RunBlockingInParallel(std::move(cb));
   }
 
-  if (*status != OpStatus::OK) {
+  VLOG(1) << "WaitReplicaFlowToCatchup done";
+
+  if (*status != OpStatus::OK || !catchup_success.load()) {
     sf_->service().SwitchState(GlobalState::TAKEN_OVER, GlobalState::ACTIVE);
     return cntx->SendError("Takeover failed!");
   }
+
   cntx->SendOk();
 
   if (save_flag) {
@@ -455,7 +478,7 @@ void DflyCmd::TakeOver(CmdArgList args, ConnectionContext* cntx) {
 void DflyCmd::Expire(CmdArgList args, ConnectionContext* cntx) {
   RedisReplyBuilder* rb = static_cast<RedisReplyBuilder*>(cntx->reply_builder());
   cntx->transaction->ScheduleSingleHop([](Transaction* t, EngineShard* shard) {
-    shard->db_slice().ExpireAllIfNeeded();
+    t->GetDbSlice(shard->shard_id()).ExpireAllIfNeeded();
     return OpStatus::OK;
   });
 
@@ -480,6 +503,7 @@ void DflyCmd::ReplicaOffset(CmdArgList args, ConnectionContext* cntx) {
 OpStatus DflyCmd::StartFullSyncInThread(FlowInfo* flow, Context* cntx, EngineShard* shard) {
   DCHECK(!flow->full_sync_fb.IsJoinable());
   DCHECK(shard);
+  DCHECK(flow->conn);
 
   // The summary contains the LUA scripts, so make sure at least (and exactly one)
   // of the flows also contain them.
@@ -506,13 +530,10 @@ OpStatus DflyCmd::StartFullSyncInThread(FlowInfo* flow, Context* cntx, EngineSha
     return OpStatus::CANCELLED;
   }
 
-  // Shard can be null for io thread.
-  if (shard != nullptr) {
-    if (flow->start_partial_sync_at.has_value())
-      saver->StartIncrementalSnapshotInShard(cntx, shard, *flow->start_partial_sync_at);
-    else
-      saver->StartSnapshotInShard(true, cntx->GetCancellation(), shard);
-  }
+  if (flow->start_partial_sync_at.has_value())
+    saver->StartIncrementalSnapshotInShard(cntx, shard, *flow->start_partial_sync_at);
+  else
+    saver->StartSnapshotInShard(true, cntx->GetCancellation(), shard);
 
   flow->full_sync_fb = fb2::Fiber("full_sync", &DflyCmd::FullSyncFb, this, flow, cntx);
   return OpStatus::OK;
@@ -534,12 +555,12 @@ void DflyCmd::StopFullSyncInThread(FlowInfo* flow, EngineShard* shard) {
 
 OpStatus DflyCmd::StartStableSyncInThread(FlowInfo* flow, Context* cntx, EngineShard* shard) {
   // Create streamer for shard flows.
+  DCHECK(shard);
+  DCHECK(flow->conn);
 
-  if (shard != nullptr) {
-    flow->streamer.reset(new JournalStreamer(sf_->journal(), cntx));
-    bool send_lsn = flow->version >= DflyVersion::VER4;
-    flow->streamer->Start(flow->conn->socket(), send_lsn);
-  }
+  flow->streamer.reset(new JournalStreamer(sf_->journal(), cntx));
+  bool send_lsn = flow->version >= DflyVersion::VER4;
+  flow->streamer->Start(flow->conn->socket(), send_lsn);
 
   // Register cleanup.
   flow->cleanup = [flow]() {
@@ -556,6 +577,8 @@ void DflyCmd::FullSyncFb(FlowInfo* flow, Context* cntx) {
   error_code ec;
 
   if (ec = flow->saver->SaveBody(cntx, nullptr); ec) {
+    if (!flow->conn->socket()->IsOpen())
+      ec = make_error_code(errc::operation_canceled);  // we cancelled the operation.
     cntx->ReportError(ec);
     return;
   }
@@ -567,8 +590,7 @@ void DflyCmd::FullSyncFb(FlowInfo* flow, Context* cntx) {
   }
 }
 
-auto DflyCmd::CreateSyncSession(ConnectionContext* cntx)
-    -> std::pair<uint32_t, std::shared_ptr<ReplicaInfo>> {
+auto DflyCmd::CreateSyncSession(ConnectionContext* cntx) -> std::pair<uint32_t, unsigned> {
   unique_lock lk(mu_);
   unsigned sync_id = next_sync_id_++;
 
@@ -581,7 +603,7 @@ auto DflyCmd::CreateSyncSession(ConnectionContext* cntx)
     fb2::Fiber("stop_replication", &DflyCmd::StopReplication, this, sync_id).Detach();
   };
 
-  string address = cntx->conn()->RemoteEndpointAddress();
+  string address = cntx->conn_state.replication_info.repl_ip_address;
   uint32_t port = cntx->conn_state.replication_info.repl_listening_port;
 
   LOG(INFO) << "Registered replica " << address << ":" << port;
@@ -591,10 +613,11 @@ auto DflyCmd::CreateSyncSession(ConnectionContext* cntx)
   auto [it, inserted] = replica_infos_.emplace(sync_id, std::move(replica_ptr));
   CHECK(inserted);
 
-  return *it;
+  return {it->first, flow_count};
 }
 
-auto DflyCmd::GetReplicaInfo(ConnectionContext* cntx) -> std::shared_ptr<ReplicaInfo> {
+auto DflyCmd::GetReplicaInfoFromConnection(ConnectionContext* cntx)
+    -> std::shared_ptr<ReplicaInfo> {
   if (cntx == nullptr) {
     return nullptr;
   }
@@ -609,18 +632,10 @@ auto DflyCmd::GetReplicaInfo(ConnectionContext* cntx) -> std::shared_ptr<Replica
 }
 
 void DflyCmd::OnClose(ConnectionContext* cntx) {
-  unsigned session_id = cntx->conn_state.replication_info.repl_session_id;
-  if (!session_id)
+  unsigned sync_id = cntx->conn_state.replication_info.repl_session_id;
+  if (!sync_id)
     return;
-
-  auto replica_ptr = GetReplicaInfo(session_id);
-  if (!replica_ptr)
-    return;
-
-  // Because CancelReplication holds the per-replica mutex,
-  // aborting connection will block here until cancellation finishes.
-  // This allows keeping resources alive during the cleanup phase.
-  CancelReplication(session_id, replica_ptr);
+  StopReplication(sync_id);
 }
 
 void DflyCmd::StopReplication(uint32_t sync_id) {
@@ -628,40 +643,47 @@ void DflyCmd::StopReplication(uint32_t sync_id) {
   if (!replica_ptr)
     return;
 
-  CancelReplication(sync_id, replica_ptr);
+  // Because CancelReplication holds the per-replica mutex,
+  // aborting connection will block here until cancellation finishes.
+  // This allows keeping resources alive during the cleanup phase.
+  replica_ptr->Cancel();
+
+  lock_guard lk(mu_);
+  replica_infos_.erase(sync_id);
 }
 
-void DflyCmd::CancelReplication(uint32_t sync_id, shared_ptr<ReplicaInfo> replica_ptr) {
-  lock_guard lk(replica_ptr->mu);
-  if (replica_ptr->replica_state == SyncState::CANCELLED) {
+void DflyCmd::BreakStalledFlowsInShard() {
+  unique_lock global_lock(mu_, try_to_lock);
+
+  // give up on blocking because we run this function periodically in a background fiber,
+  // so it will eventually grab the lock.
+  if (!global_lock.owns_lock())
     return;
-  }
 
-  LOG(INFO) << "Disconnecting from replica " << replica_ptr->address << ":"
-            << replica_ptr->listening_port;
+  ShardId sid = EngineShard::tlocal()->shard_id();
+  vector<uint32_t> deleted;
 
-  // Update replica_ptr state and cancel context.
-  replica_ptr->replica_state = SyncState::CANCELLED;
-  replica_ptr->cntx.Cancel();
+  for (auto [sync_id, replica_ptr] : replica_infos_) {
+    shared_lock replica_lock = replica_ptr->GetSharedLock();
 
-  // Wait for tasks to finish.
-  shard_set->RunBlockingInParallel([replica_ptr](EngineShard* shard) {
-    FlowInfo* flow = &replica_ptr->flows[shard->shard_id()];
-    if (flow->cleanup) {
-      flow->cleanup();
+    if (!replica_ptr->flows[sid].saver)
+      continue;
+
+    // If saver is present - we are currently using it for full sync.
+    int64_t last_write_ns = replica_ptr->flows[sid].saver->GetLastWriteTime();
+    int64_t timeout_ns = int64_t(absl::GetFlag(FLAGS_replication_timeout)) * 1'000'000LL;
+    int64_t now = absl::GetCurrentTimeNanos();
+    if (last_write_ns > 0 && last_write_ns + timeout_ns < now) {
+      VLOG(1) << "Breaking full sync for sync_id " << sync_id << " last_write_ts: " << last_write_ns
+              << ", now: " << now;
+      deleted.push_back(sync_id);
+      replica_lock.unlock();
+      replica_ptr->Cancel();
     }
-
-    flow->full_sync_fb.JoinIfNeeded();
-  });
-
-  // Remove ReplicaInfo from global map
-  {
-    lock_guard lk(mu_);
-    replica_infos_.erase(sync_id);
   }
 
-  // Wait for error handler to quit.
-  replica_ptr->cntx.JoinErrorHandler();
+  for (auto sync_id : deleted)
+    replica_infos_.erase(sync_id);
 }
 
 shared_ptr<DflyCmd::ReplicaInfo> DflyCmd::GetReplicaInfo(uint32_t sync_id) {
@@ -678,7 +700,7 @@ std::vector<ReplicaRoleInfo> DflyCmd::GetReplicasRoleInfo() const {
   lock_guard lk(mu_);
 
   vec.reserve(replica_infos_.size());
-  auto replication_lags = ReplicationLags();
+  map replication_lags = ReplicationLagsLocked();
 
   for (const auto& [id, info] : replica_infos_) {
     LSN lag = replication_lags[id];
@@ -686,13 +708,13 @@ std::vector<ReplicaRoleInfo> DflyCmd::GetReplicasRoleInfo() const {
 
     // If the replica state being updated, its lag is undefined,
     // the same applies of course if its state is not STABLE_SYNC.
-    if (info->mu.try_lock()) {
+    shared_lock lk(info->shared_mu, try_to_lock);
+    if (lk.owns_lock()) {
       state = info->replica_state;
       // If the replica is not in stable sync, its lag is undefined, so we set it to 0.
       if (state != SyncState::STABLE_SYNC) {
         lag = 0;
       }
-      info->mu.unlock();
     } else {
       lag = 0;
     }
@@ -703,41 +725,41 @@ std::vector<ReplicaRoleInfo> DflyCmd::GetReplicasRoleInfo() const {
 }
 
 void DflyCmd::GetReplicationMemoryStats(ReplicationMemoryStats* stats) const {
-  util::fb2::Mutex stats_mu;
+  atomic<size_t> streamer_bytes{0}, full_sync_bytes{0};
 
-  lock_guard lk_main{mu_};  // prevent state changes
-  auto cb = [this, &stats, &stats_mu](EngineShard* shard) {
-    lock_guard lk{stats_mu};
-    for (const auto& [_, info] : replica_infos_) {
-      lock_guard repl_lk{info->mu};
+  {
+    lock_guard lk{mu_};  // prevent state changes
+    auto cb = [&](EngineShard* shard) {
+      for (const auto& [_, info] : replica_infos_) {
+        shared_lock repl_lk = info->GetSharedLock();
 
-      // flows should not be empty.
-      DCHECK(!info->flows.empty());
-      if (info->flows.empty())
-        continue;
+        // flows should not be empty.
+        DCHECK(!info->flows.empty());
+        if (info->flows.empty())
+          continue;
 
-      const auto& flow = info->flows[shard->shard_id()];
-
-      if (flow.streamer)
-        stats->streamer_buf_capacity_bytes += flow.streamer->GetTotalBufferCapacities();
-
-      if (flow.saver)
-        stats->full_sync_buf_bytes += flow.saver->GetTotalBuffersSize();
-    }
-  };
-  shard_set->RunBlockingInParallel(cb);
+        const auto& flow = info->flows[shard->shard_id()];
+        if (flow.streamer)
+          streamer_bytes.fetch_add(flow.streamer->GetTotalBufferCapacities(), memory_order_relaxed);
+        if (flow.saver)
+          full_sync_bytes.fetch_add(flow.saver->GetTotalBuffersSize(), memory_order_relaxed);
+      }
+    };
+    shard_set->RunBlockingInParallel(cb);
+  }
+  stats->streamer_buf_capacity_bytes += streamer_bytes.load(memory_order_relaxed);
+  stats->full_sync_buf_bytes += full_sync_bytes.load(memory_order_relaxed);
 }
 
 pair<uint32_t, shared_ptr<DflyCmd::ReplicaInfo>> DflyCmd::GetReplicaInfoOrReply(
     std::string_view id_str, RedisReplyBuilder* rb) {
-  unique_lock lk(mu_);
-
   uint32_t sync_id;
   if (!ToSyncId(id_str, &sync_id)) {
     rb->SendError(kInvalidSyncId);
     return {0, nullptr};
   }
 
+  lock_guard lk(mu_);
   auto sync_it = replica_infos_.find(sync_id);
   if (sync_it == replica_infos_.end()) {
     rb->SendError(kIdNotFound);
@@ -747,7 +769,7 @@ pair<uint32_t, shared_ptr<DflyCmd::ReplicaInfo>> DflyCmd::GetReplicaInfoOrReply(
   return {sync_id, sync_it->second};
 }
 
-std::map<uint32_t, LSN> DflyCmd::ReplicationLags() const {
+std::map<uint32_t, LSN> DflyCmd::ReplicationLagsLocked() const {
   DCHECK(!mu_.try_lock());  // expects to be under global lock
   if (replica_infos_.empty())
     return {};
@@ -784,6 +806,8 @@ void DflyCmd::SetDflyClientVersion(ConnectionContext* cntx, DflyVersion version)
 }
 
 // Must run under locked replica_info.mu.
+// TODO: it's a bad design that we enforce replies under a lock because Send can potentially
+// block, leading to high contention in some case. Split it and avoid replying under a lock.
 bool DflyCmd::CheckReplicaStateOrReply(const ReplicaInfo& repl_info, SyncState expected,
                                        RedisReplyBuilder* rb) {
   if (repl_info.replica_state != expected) {
@@ -803,9 +827,6 @@ bool DflyCmd::CheckReplicaStateOrReply(const ReplicaInfo& repl_info, SyncState e
   return true;
 }
 
-void DflyCmd::BreakOnShutdown() {
-}
-
 void DflyCmd::Shutdown() {
   ReplicaInfoMap pending;
   {
@@ -813,15 +834,15 @@ void DflyCmd::Shutdown() {
     pending = std::move(replica_infos_);
   }
 
-  for (auto [sync_id, replica_ptr] : pending) {
-    CancelReplication(sync_id, replica_ptr);
+  for (auto& [_, replica_ptr] : pending) {
+    replica_ptr->Cancel();
   }
 }
 
 void FlowInfo::TryShutdownSocket() {
   // Close socket for clean disconnect.
   if (conn->socket()->IsOpen()) {
-    (void)conn->socket()->Shutdown(SHUT_RDWR);
+    std::ignore = conn->socket()->Shutdown(SHUT_RDWR);
   }
 }
 

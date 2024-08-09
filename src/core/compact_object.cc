@@ -569,7 +569,7 @@ size_t CompactObj::Size() const {
         break;
       }
       case EXTERNAL_TAG:
-        raw_size = u_.ext_ptr.size;
+        raw_size = u_.ext_ptr.serialized_size;
         break;
       case ROBJ_TAG:
         raw_size = u_.r_obj.Size();
@@ -621,7 +621,7 @@ uint64_t CompactObj::HashCode(string_view str) {
   return XXH3_64bits_withSeed(str.data(), str.size(), kHashSeed);
 }
 
-unsigned CompactObj::ObjType() const {
+CompactObjType CompactObj::ObjType() const {
   if (IsInline() || taglen_ == INT_TAG || taglen_ == SMALL_TAG || taglen_ == EXTERNAL_TAG)
     return OBJ_STRING;
 
@@ -637,30 +637,7 @@ unsigned CompactObj::ObjType() const {
   }
 
   LOG(FATAL) << "TBD " << int(taglen_);
-  return 0;
-}
-
-string_view CompactObj::ObjTypeToString(unsigned type) {
-#define OBJECT_TYPE_CASE(type) \
-  case type:                   \
-    return absl::StripPrefix(#type, "OBJ_")
-
-  switch (type) {
-    OBJECT_TYPE_CASE(OBJ_STRING);
-    OBJECT_TYPE_CASE(OBJ_LIST);
-    OBJECT_TYPE_CASE(OBJ_SET);
-    OBJECT_TYPE_CASE(OBJ_ZSET);
-    OBJECT_TYPE_CASE(OBJ_HASH);
-    OBJECT_TYPE_CASE(OBJ_MODULE);
-    OBJECT_TYPE_CASE(OBJ_STREAM);
-    OBJECT_TYPE_CASE(OBJ_JSON);
-    OBJECT_TYPE_CASE(OBJ_SBF);
-    default:
-      DCHECK(false) << "Unknown object type " << type;
-      return "OTHER";
-  }
-
-#undef OBJECT_TYPE_CASE
+  return kInvalidCompactObjType;
 }
 
 unsigned CompactObj::Encoding() const {
@@ -674,7 +651,7 @@ unsigned CompactObj::Encoding() const {
   }
 }
 
-void CompactObj::InitRobj(unsigned type, unsigned encoding, void* obj) {
+void CompactObj::InitRobj(CompactObjType type, unsigned encoding, void* obj) {
   DCHECK_NE(type, OBJ_STRING);
   SetMeta(ROBJ_TAG, mask_);
   u_.r_obj.Init(type, encoding, obj);
@@ -761,52 +738,7 @@ void CompactObj::SetString(std::string_view str) {
     }
   }
 
-  DCHECK_GT(str.size(), kInlineLen);
-
-  string_view encoded = str;
-  bool is_ascii = kUseAsciiEncoding && detail::validate_ascii_fast(str.data(), str.size());
-
-  if (is_ascii) {
-    size_t encode_len = binpacked_len(str.size());
-    size_t rev_len = ascii_len(encode_len);
-
-    if (rev_len == str.size()) {
-      mask |= ASCII2_ENC_BIT;  // str hits its highest bound.
-    } else {
-      CHECK_EQ(str.size(), rev_len - 1) << "Bad ascii encoding for len " << str.size();
-
-      mask |= ASCII1_ENC_BIT;
-    }
-
-    tl.tmp_buf.resize(encode_len);
-    detail::ascii_pack_simd2(str.data(), str.size(), tl.tmp_buf.data());
-    encoded = string_view{reinterpret_cast<char*>(tl.tmp_buf.data()), encode_len};
-
-    if (encoded.size() <= kInlineLen) {
-      SetMeta(encoded.size(), mask);
-      detail::ascii_pack(str.data(), str.size(), reinterpret_cast<uint8_t*>(u_.inline_str));
-
-      return;
-    }
-  }
-
-  if (kUseSmallStrings && SmallString::CanAllocate(encoded.size())) {
-    if (taglen_ == 0) {
-      SetMeta(SMALL_TAG, mask);
-      tl.small_str_bytes += u_.small_str.Assign(encoded);
-      return;
-    }
-
-    if (taglen_ == SMALL_TAG && encoded.size() <= u_.small_str.size()) {
-      mask_ = mask;
-      tl.small_str_bytes -= u_.small_str.MallocUsed();
-      tl.small_str_bytes += u_.small_str.Assign(encoded);
-      return;
-    }
-  }
-
-  SetMeta(ROBJ_TAG, mask);
-  u_.r_obj.SetString(encoded, tl.local_mr);
+  EncodeString(str);
 }
 
 string_view CompactObj::GetSlice(string* scratch) const {
@@ -986,18 +918,67 @@ void CompactObj::GetString(char* dest) const {
   LOG(FATAL) << "Bad tag " << int(taglen_);
 }
 
-void CompactObj::SetExternal(size_t offset, size_t sz) {
-  SetMeta(EXTERNAL_TAG, mask_ & ~kEncMask);
+void CompactObj::SetExternal(size_t offset, uint32_t sz) {
+  SetMeta(EXTERNAL_TAG, mask_);
 
-  u_.ext_ptr.page_index = offset / 4096;
+  u_.ext_ptr.is_cool = 0;
   u_.ext_ptr.page_offset = offset % 4096;
-  u_.ext_ptr.size = sz;
+  u_.ext_ptr.serialized_size = sz;
+  u_.ext_ptr.offload.page_index = offset / 4096;
+}
+
+void CompactObj::SetCool(size_t offset, uint32_t sz, detail::TieredColdRecord* record) {
+  // We copy the mask of the "cooled" referenced object because it contains the encoding info.
+  SetMeta(EXTERNAL_TAG, record->value.mask_);
+
+  u_.ext_ptr.is_cool = 1;
+  u_.ext_ptr.page_offset = offset % 4096;
+  u_.ext_ptr.serialized_size = sz;
+  u_.ext_ptr.cool_record = record;
+}
+
+auto CompactObj::GetCool() const -> CoolItem {
+  DCHECK(IsExternal() && u_.ext_ptr.is_cool);
+
+  CoolItem res;
+  res.page_offset = u_.ext_ptr.page_offset;
+  res.serialized_size = u_.ext_ptr.serialized_size;
+  res.record = u_.ext_ptr.cool_record;
+  return res;
+}
+
+void CompactObj::ImportExternal(const CompactObj& src) {
+  DCHECK(src.IsExternal());
+  SetMeta(EXTERNAL_TAG, src.mask_ & kEncMask);
+  u_.ext_ptr = src.u_.ext_ptr;
 }
 
 std::pair<size_t, size_t> CompactObj::GetExternalSlice() const {
   DCHECK_EQ(EXTERNAL_TAG, taglen_);
-  size_t offset = size_t(u_.ext_ptr.page_index) * 4096 + u_.ext_ptr.page_offset;
-  return pair<size_t, size_t>(offset, size_t(u_.ext_ptr.size));
+  auto& ext = u_.ext_ptr;
+  size_t offset = ext.page_offset;
+  offset += size_t(ext.is_cool ? ext.cool_record->page_index : ext.offload.page_index) * 4096;
+  return pair<size_t, size_t>(offset, size_t(u_.ext_ptr.serialized_size));
+}
+
+void CompactObj::Materialize(std::string_view blob, bool is_raw) {
+  CHECK(IsExternal()) << int(taglen_);
+
+  DCHECK_GT(blob.size(), kInlineLen);
+
+  if (is_raw) {
+    uint8_t mask = mask_;
+
+    if (kUseSmallStrings && SmallString::CanAllocate(blob.size())) {
+      SetMeta(SMALL_TAG, mask);
+      tl.small_str_bytes += u_.small_str.Assign(blob);
+    } else {
+      SetMeta(ROBJ_TAG, mask);
+      u_.r_obj.SetString(blob, tl.local_mr);
+    }
+  } else {
+    EncodeString(blob);
+  }
 }
 
 void CompactObj::Reset() {
@@ -1174,12 +1155,106 @@ bool CompactObj::CmpEncoded(string_view sv) const {
   return false;
 }
 
+void CompactObj::EncodeString(string_view str) {
+  DCHECK_GT(str.size(), kInlineLen);
+
+  uint8_t mask = mask_ & ~kEncMask;
+  string_view encoded = str;
+  bool is_ascii = kUseAsciiEncoding && detail::validate_ascii_fast(str.data(), str.size());
+
+  if (is_ascii) {
+    size_t encode_len = binpacked_len(str.size());
+    size_t rev_len = ascii_len(encode_len);
+
+    if (rev_len == str.size()) {
+      mask |= ASCII2_ENC_BIT;  // str hits its highest bound.
+    } else {
+      CHECK_EQ(str.size(), rev_len - 1) << "Bad ascii encoding for len " << str.size();
+
+      mask |= ASCII1_ENC_BIT;
+    }
+
+    tl.tmp_buf.resize(encode_len);
+    detail::ascii_pack_simd2(str.data(), str.size(), tl.tmp_buf.data());
+    encoded = string_view{reinterpret_cast<char*>(tl.tmp_buf.data()), encode_len};
+
+    if (encoded.size() <= kInlineLen) {
+      SetMeta(encoded.size(), mask);
+      detail::ascii_pack(str.data(), str.size(), reinterpret_cast<uint8_t*>(u_.inline_str));
+
+      return;
+    }
+  }
+
+  if (kUseSmallStrings && SmallString::CanAllocate(encoded.size())) {
+    if (taglen_ == 0) {
+      SetMeta(SMALL_TAG, mask);
+      tl.small_str_bytes += u_.small_str.Assign(encoded);
+      return;
+    }
+
+    if (taglen_ == SMALL_TAG && encoded.size() <= u_.small_str.size()) {
+      mask_ = mask;
+      tl.small_str_bytes -= u_.small_str.MallocUsed();
+      tl.small_str_bytes += u_.small_str.Assign(encoded);
+      return;
+    }
+  }
+
+  SetMeta(ROBJ_TAG, mask);
+  u_.r_obj.SetString(encoded, tl.local_mr);
+}
+
+StringOrView CompactObj::GetRawString() const {
+  DCHECK(!IsExternal());
+
+  if (taglen_ == ROBJ_TAG) {
+    CHECK_EQ(OBJ_STRING, u_.r_obj.type());
+    DCHECK_EQ(OBJ_ENCODING_RAW, u_.r_obj.encoding());
+    return StringOrView::FromView(u_.r_obj.AsView());
+  }
+
+  if (taglen_ == SMALL_TAG) {
+    string tmp;
+    u_.small_str.Get(&tmp);
+    return StringOrView::FromString(std::move(tmp));
+  }
+
+  LOG(FATAL) << "Unsupported tag for GetRawString(): " << taglen_;
+  return {};
+}
+
 size_t CompactObj::DecodedLen(size_t sz) const {
   return ascii_len(sz) - ((mask_ & ASCII1_ENC_BIT) ? 1 : 0);
 }
 
 MemoryResource* CompactObj::memory_resource() {
   return tl.local_mr;
+}
+
+constexpr std::pair<CompactObjType, std::string_view> kObjTypeToString[8] = {
+    {OBJ_STRING, "string"sv},  {OBJ_LIST, "list"sv},    {OBJ_SET, "set"sv},
+    {OBJ_ZSET, "zset"sv},      {OBJ_HASH, "hash"sv},    {OBJ_STREAM, "stream"sv},
+    {OBJ_JSON, "ReJSON-RL"sv}, {OBJ_SBF, "MBbloom--"sv}};
+
+std::string_view ObjTypeToString(CompactObjType type) {
+  for (auto& p : kObjTypeToString) {
+    if (type == p.first) {
+      return p.second;
+    }
+  }
+
+  LOG(DFATAL) << "Unsupported type " << type;
+  return "Invalid type"sv;
+}
+
+std::optional<CompactObjType> ObjTypeFromString(std::string_view sv) {
+  for (auto& p : kObjTypeToString) {
+    if (absl::EqualsIgnoreCase(sv, p.second)) {
+      return p.first;
+    }
+  }
+  return std::nullopt;
 }
 
 }  // namespace dfly

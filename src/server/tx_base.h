@@ -8,12 +8,15 @@
 
 #include <optional>
 
+#include "base/iterator.h"
 #include "src/facade/facade_types.h"
 
 namespace dfly {
 
 class EngineShard;
 class Transaction;
+class Namespace;
+class DbSlice;
 
 using DbIndex = uint16_t;
 using ShardId = uint16_t;
@@ -32,46 +35,60 @@ struct KeyLockArgs {
 
 // Describes key indices.
 struct KeyIndex {
-  unsigned start;
-  unsigned end;   // does not include this index (open limit).
-  unsigned step;  // 1 for commands like mget. 2 for commands like mset.
-
-  // if index is non-zero then adds another key index (usually 0).
-  // relevant for for commands like ZUNIONSTORE/ZINTERSTORE for destination key.
-  std::optional<uint16_t> bonus{};
-
-  KeyIndex(unsigned s = 0, unsigned e = 0, unsigned step = 0) : start(s), end(e), step(step) {
+  KeyIndex(unsigned start = 0, unsigned end = 0, unsigned step = 1,
+           std::optional<unsigned> bonus = std::nullopt)
+      : start(start), end(end), step(step), bonus(bonus) {
   }
 
-  static KeyIndex Range(unsigned start, unsigned end, unsigned step = 1) {
-    return KeyIndex{start, end, step};
+  using iterator_category = std::forward_iterator_tag;
+  using value_type = unsigned;
+  using difference_type = std::ptrdiff_t;
+  using pointer = value_type;
+  using reference = value_type;
+
+  unsigned operator*() const;
+  KeyIndex& operator++();
+  bool operator!=(const KeyIndex& ki) const;
+
+  unsigned NumArgs() const {
+    return (end - start) + unsigned(bonus.has_value());
   }
 
-  bool HasSingleKey() const {
-    return !bonus && (start + step >= end);
+  auto Range() const {
+    return base::it::Range(*this, KeyIndex{end, end, step, std::nullopt});
   }
 
-  unsigned num_args() const {
-    return end - start + bool(bonus);
+  auto Range(facade::ArgRange args) const {
+    return base::it::Transform([args](unsigned idx) { return args[idx]; }, Range());
   }
+
+ public:
+  unsigned start, end, step;      // [start, end) with step
+  std::optional<unsigned> bonus;  // destination key, for example for commands that end with STORE
 };
 
 struct DbContext {
+  Namespace* ns = nullptr;
   DbIndex db_index = 0;
   uint64_t time_now_ms = 0;
+
+  // Convenience method.
+  DbSlice& GetDbSlice(ShardId shard_id) const;
 };
 
 struct OpArgs {
-  EngineShard* shard;
-  const Transaction* tx;
+  EngineShard* shard = nullptr;
+  const Transaction* tx = nullptr;
   DbContext db_cntx;
 
-  OpArgs() : shard(nullptr), tx(nullptr) {
-  }
+  OpArgs() = default;
 
   OpArgs(EngineShard* s, const Transaction* tx, const DbContext& cntx)
       : shard(s), tx(tx), db_cntx(cntx) {
   }
+
+  // Convenience method.
+  DbSlice& GetDbSlice() const;
 };
 
 // A strong type for a lock tag. Helps to disambiguate between keys and the parts of the
@@ -201,12 +218,9 @@ class ShardArgs {
 
 // Record non auto journal command with own txid and dbid.
 void RecordJournal(const OpArgs& op_args, std::string_view cmd, const ShardArgs& args,
-                   uint32_t shard_cnt = 1, bool multi_commands = false);
+                   uint32_t shard_cnt = 1);
 void RecordJournal(const OpArgs& op_args, std::string_view cmd, ArgSlice args,
-                   uint32_t shard_cnt = 1, bool multi_commands = false);
-
-// Record non auto journal command finish. Call only when command translates to multi commands.
-void RecordJournalFinish(const OpArgs& op_args, uint32_t shard_cnt);
+                   uint32_t shard_cnt = 1);
 
 // Record expiry in journal with independent transaction. Must be called from shard thread holding
 // key.

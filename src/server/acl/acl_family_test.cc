@@ -4,10 +4,11 @@
 
 #include "server/acl/acl_family.h"
 
-#include "absl/container/flat_hash_map.h"
-#include "absl/flags/internal/flag.h"
-#include "absl/strings/ascii.h"
-#include "absl/strings/str_cat.h"
+#include <absl/container/flat_hash_map.h>
+#include <absl/strings/ascii.h>
+#include <absl/strings/str_cat.h>
+
+#include "base/flags.h"
 #include "base/gtest.h"
 #include "base/logging.h"
 #include "facade/facade_test.h"
@@ -108,6 +109,10 @@ TEST_F(AclFamilyTest, AclSetUser) {
   vec = resp.GetVec();
   EXPECT_THAT(vec,
               UnorderedElementsAre("user default on nopass ~* +@all", "user vlad on -@all +acl"));
+
+  // +@NONE should not exist anymore. It's not in the spec.
+  resp = Run({"ACL", "SETUSER", "rand", "+@NONE"});
+  EXPECT_THAT(resp, ErrArg("ERR Unrecognized parameter +@NONE"));
 }
 
 TEST_F(AclFamilyTest, AclDelUser) {
@@ -198,8 +203,8 @@ TEST_F(AclFamilyTest, AclWhoAmI) {
 }
 
 TEST_F(AclFamilyTest, TestAllCategories) {
-  TestInitAclFam();
-  for (auto& cat : acl::REVERSE_CATEGORY_INDEX_TABLE) {
+  const auto* fam = TestInitAclFam();
+  for (auto& cat : fam->GetRevTable()) {
     if (cat != "_RESERVED") {
       auto resp = Run({"ACL", "SETUSER", "kostas", absl::StrCat("+@", cat)});
       EXPECT_THAT(resp, "OK");
@@ -222,7 +227,7 @@ TEST_F(AclFamilyTest, TestAllCategories) {
     }
   }
 
-  for (auto& cat : acl::REVERSE_CATEGORY_INDEX_TABLE) {
+  for (auto& cat : fam->GetRevTable()) {
     if (cat != "_RESERVED") {
       auto resp = Run({"ACL", "SETUSER", "kostas", absl::StrCat("+@", cat)});
       EXPECT_THAT(resp, "OK");
@@ -245,8 +250,8 @@ TEST_F(AclFamilyTest, TestAllCategories) {
 }
 
 TEST_F(AclFamilyTest, TestAllCommands) {
-  TestInitAclFam();
-  const auto& rev_indexer = acl::CommandsRevIndexer();
+  const auto* fam = TestInitAclFam();
+  const auto& rev_indexer = fam->GetCommandsRevIndexer();
   for (const auto& family : rev_indexer) {
     for (const auto& command_name : family) {
       auto resp = Run({"ACL", "SETUSER", "kostas", absl::StrCat("+", command_name)});

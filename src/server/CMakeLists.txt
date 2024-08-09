@@ -18,7 +18,7 @@ if ("${CMAKE_SYSTEM_NAME}" STREQUAL "Linux")
       tiering/external_alloc.cc)
 
     add_executable(dfly_bench dfly_bench.cc)
-    cxx_link(dfly_bench dfly_facade fibers2 absl::random_random)
+    cxx_link(dfly_bench dfly_parser_lib fibers2 absl::random_random)
     cxx_test(tiering/disk_storage_test dfly_test_lib LABELS DFLY)
     cxx_test(tiering/op_manager_test dfly_test_lib LABELS DFLY)
     cxx_test(tiering/small_bins_test dfly_test_lib LABELS DFLY)
@@ -26,9 +26,9 @@ if ("${CMAKE_SYSTEM_NAME}" STREQUAL "Linux")
 endif()
 
 
-add_library(dfly_transaction db_slice.cc malloc_stats.cc blocking_controller.cc
+add_library(dfly_transaction db_slice.cc blocking_controller.cc
             command_registry.cc  cluster/cluster_utility.cc
-            journal/tx_executor.cc
+            journal/tx_executor.cc namespaces.cc
             common.cc journal/journal.cc journal/types.cc journal/journal_slice.cc
             server_state.cc table.cc  top_keys.cc transaction.cc tx_base.cc
             serializer_commons.cc journal/serializer.cc journal/executor.cc journal/streamer.cc
@@ -48,7 +48,7 @@ add_library(dragonfly_lib bloom_family.cc engine_shard_set.cc
             generic_family.cc hset_family.cc http_api.cc json_family.cc
             list_family.cc main_service.cc memory_cmd.cc rdb_load.cc rdb_save.cc replica.cc
             protocol_client.cc
-            snapshot.cc script_mgr.cc server_family.cc malloc_stats.cc
+            snapshot.cc script_mgr.cc server_family.cc
             detail/save_stages_controller.cc
             detail/snapshot_storage.cc
             set_family.cc stream_family.cc string_family.cc
@@ -59,7 +59,7 @@ add_library(dragonfly_lib bloom_family.cc engine_shard_set.cc
             cluster/cluster_config.cc cluster/cluster_family.cc cluster/incoming_slot_migration.cc
             cluster/outgoing_slot_migration.cc cluster/cluster_defs.cc
             acl/user.cc acl/user_registry.cc acl/acl_family.cc
-            acl/validator.cc acl/helpers.cc)
+            acl/validator.cc)
 
 if (DF_ENABLE_MEMORY_TRACKING)
   target_compile_definitions(dragonfly_lib PRIVATE DFLY_ENABLE_MEMORY_TRACKING)
@@ -78,6 +78,7 @@ find_library(ZSTD_LIB NAMES libzstd.a libzstdstatic.a zstd NAMES_PER_DIR REQUIRE
 
 if (WITH_AWS)
   SET(AWS_LIB awsv2_lib)
+  add_definitions(-DWITH_AWS)
 endif()
 
 cxx_link(dfly_transaction dfly_core strings_lib TRDP::fast_float)

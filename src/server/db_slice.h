@@ -13,6 +13,7 @@
 #include "server/conn_context.h"
 #include "server/table.h"
 #include "util/fibers/fibers.h"
+#include "util/fibers/synchronization.h"
 
 namespace dfly {
 
@@ -56,6 +57,7 @@ struct SliceEvents {
 
   // ram hit/miss when tiering is enabled
   size_t ram_hits = 0;
+  size_t ram_cool_hits = 0;
   size_t ram_misses = 0;
 
   // how many insertions were rejected due to OOM.
@@ -204,19 +206,27 @@ class DbSlice {
       std::function<void(std::string_view, const Context&, const PrimeValue& pv)>;
 
   struct ExpireParams {
-    int64_t value = INT64_MIN;  // undefined
-
-    bool absolute = false;
-    TimeUnit unit = TimeUnit::SEC;
-    bool persist = false;
-    int32_t expire_options = 0;  // ExpireFlags
-
     bool IsDefined() const {
       return persist || value > INT64_MIN;
     }
 
+    static int64_t Cap(int64_t value, TimeUnit unit);
+
     // Calculate relative and absolue timepoints.
-    std::pair<int64_t, int64_t> Calculate(int64_t now_msec) const;
+    std::pair<int64_t, int64_t> Calculate(uint64_t now_msec, bool cap = false) const;
+
+    // Return true if relative expiration is in the past
+    bool IsExpired(uint64_t now_msec) const {
+      return Calculate(now_msec, false).first < 0;
+    }
+
+   public:
+    int64_t value = INT64_MIN;  // undefined
+    TimeUnit unit = TimeUnit::SEC;
+
+    bool absolute = false;
+    bool persist = false;
+    int32_t expire_options = 0;  // ExpireFlags
   };
 
   DbSlice(uint32_t index, bool caching_mode, EngineShard* owner);
@@ -329,7 +339,7 @@ class DbSlice {
   // Creates a database with index `db_ind`. If such database exists does nothing.
   void ActivateDb(DbIndex db_ind);
 
-  bool Del(DbIndex db_ind, Iterator it);
+  bool Del(Context cntx, Iterator it);
 
   constexpr static DbIndex kDbAll = 0xFFFF;
 
@@ -381,7 +391,6 @@ class DbSlice {
   // Returns existing keys count in the db.
   size_t DbSize(DbIndex db_ind) const;
 
-  // Callback functions called upon writing to the existing key.
   DbTableStats* MutableStats(DbIndex db_ind) {
     return &db_arr_[db_ind]->stats;
   }
@@ -403,12 +412,24 @@ class DbSlice {
     return version_;
   }
 
+  size_t table_memory() const {
+    return table_memory_;
+  }
+
+  size_t entries_count() const {
+    return entries_count_;
+  }
+
   using ChangeCallback = std::function<void(DbIndex, const ChangeReq&)>;
 
   //! Registers the callback to be called for each change.
   //! Returns the registration id which is also the unique version of the dbslice
   //! at a time of the call.
   uint64_t RegisterOnChange(ChangeCallback cb);
+
+  bool HasRegisteredCallbacks() const {
+    return !change_cb_.empty();
+  }
 
   // Call registered callbacks with version less than upper_bound.
   void FlushChangeToEarlierCallbacks(DbIndex db_ind, Iterator it, uint64_t upper_bound);
@@ -424,7 +445,12 @@ class DbSlice {
 
   // Deletes some amount of possible expired items.
   DeleteExpiredStats DeleteExpiredStep(const Context& cntx, unsigned count);
-  void FreeMemWithEvictionStep(DbIndex db_indx, size_t increase_goal_bytes);
+
+  // Evicts items with dynamically allocated data from the primary table.
+  // Does not shrink tables.
+  // Returnes number of (elements,bytes) freed due to evictions.
+  std::pair<uint64_t, size_t> FreeMemWithEvictionStep(DbIndex db_indx, size_t starting_segment_id,
+                                                      size_t increase_goal_bytes);
   void ScheduleForOffloadStep(DbIndex db_indx, size_t increase_goal_bytes);
 
   int32_t GetNextSegmentForEviction(int32_t segment_id, DbIndex db_ind) const;
@@ -456,6 +482,8 @@ class DbSlice {
   // Resets events_ member. Used by CONFIG RESETSTAT
   void ResetEvents();
 
+  // Controls the expiry/eviction state. The server may enter states where
+  // Both evictions and expiries will be stopped for a short period of time.
   void SetExpireAllowed(bool is_allowed) {
     expire_allowed_ = is_allowed;
   }
@@ -469,12 +497,18 @@ class DbSlice {
   void PerformDeletion(Iterator del_it, DbTable* table);
   void PerformDeletion(PrimeIterator del_it, DbTable* table);
 
-  void LockChangeCb() const {
-    return cb_mu_.lock_shared();
+  // Provides access to the internal lock of db_slice for flows that serialize
+  // entries with preemption and need to synchronize with Traverse below which
+  // acquires the same lock.
+  ThreadLocalMutex* GetSerializationMutex() {
+    return &local_mu_;
   }
 
-  void UnlockChangeCb() const {
-    return cb_mu_.unlock_shared();
+  // Wrapper around DashTable::Traverse that allows preemptions
+  template <typename Cb, typename DashTable>
+  PrimeTable::Cursor Traverse(DashTable* pt, PrimeTable::Cursor cursor, Cb&& cb) {
+    std::unique_lock lk(local_mu_);
+    return pt->Traverse(cursor, std::forward<Cb>(cb));
   }
 
  private:
@@ -494,10 +528,8 @@ class DbSlice {
   // Invalidate all watched keys for given slots. Used on FlushSlots.
   void InvalidateSlotWatches(const cluster::SlotSet& slot_ids);
 
-  // Properly clear db_arr before deleting it. If async is set, it's called from a detached fiber
-  // after swapping the db.
-  void ClearEntriesOnFlush(absl::Span<const DbIndex> indices, const DbTableArray& db_arr,
-                           bool async);
+  // Clear tiered storage entries for the specified indices.
+  void ClearOffloadedEntries(absl::Span<const DbIndex> indices, const DbTableArray& db_arr);
 
   void PerformDeletion(Iterator del_it, ExpIterator exp_it, DbTable* table);
 
@@ -505,7 +537,6 @@ class DbSlice {
   void SendInvalidationTrackingMessage(std::string_view key);
 
   void CreateDb(DbIndex index);
-  size_t EvictObjects(size_t memory_to_free, Iterator it, DbTable* table);
 
   enum class UpdateStatsMode {
     kReadStats,
@@ -531,9 +562,10 @@ class DbSlice {
     return version_++;
   }
 
-  void CallChangeCallbacks(DbIndex id, const ChangeReq& cr) const;
+  void CallChangeCallbacks(DbIndex id, std::string_view key, const ChangeReq& cr) const;
 
- private:
+  // Used to provide exclusive access while Traversing segments
+  mutable ThreadLocalMutex local_mu_;
   ShardId shard_id_;
   uint8_t caching_mode_ : 1;
 
@@ -543,9 +575,11 @@ class DbSlice {
   bool expire_allowed_ = true;
 
   uint64_t version_ = 1;  // Used to version entries in the PrimeTable.
-  ssize_t memory_budget_ = SSIZE_MAX;
+  ssize_t memory_budget_ = SSIZE_MAX / 2;
   size_t bytes_per_object_ = 0;
   size_t soft_budget_limit_ = 0;
+  size_t table_memory_ = 0;
+  uint64_t entries_count_ = 0;
 
   mutable SliceEvents events_;  // we may change this even for const operations.
 
@@ -554,14 +588,8 @@ class DbSlice {
   // Used in temporary computations in Acquire/Release.
   mutable absl::flat_hash_set<uint64_t> uniq_fps_;
 
-  // To ensure correct data replication, we must serialize the buckets that each running command
-  // will modify, followed by serializing the command to the journal. We use a mutex to prevent
-  // interleaving between bucket and journal registrations, and the command execution with its
-  // journaling. LockChangeCb is called before the callback, and UnlockChangeCb is called after
-  // journaling is completed. Register to bucket and journal changes is also does without preemption
-  mutable util::fb2::SharedMutex cb_mu_;
   // ordered from the smallest to largest version.
-  std::vector<std::pair<uint64_t, ChangeCallback>> change_cb_;
+  std::list<std::pair<uint64_t, ChangeCallback>> change_cb_;
 
   // Used in temporary computations in Find item and CbFinish
   mutable absl::flat_hash_set<CompactObjectView> fetched_items_;

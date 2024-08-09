@@ -9,7 +9,9 @@
 
 다른 언어 번역본:  [English](README.zh-CN.md) [简体中文](README.zh-CN.md) [日本語](README.ja-JP.md)
 
-[Website](https://www.dragonflydb.io/) • [Docs](https://dragonflydb.io/docs) • [Quick Start](https://www.dragonflydb.io/docs/getting-started) • [Community Discord](https://discord.gg/HsPjXGVH85) • [GitHub Discussions](https://github.com/dragonflydb/dragonfly/discussions) | [GitHub Issues](https://github.com/dragonflydb/dragonfly/issues) | [Contributing](https://github.com/dragonflydb/dragonfly/blob/main/CONTRIBUTING.md)
+[Website](https://www.dragonflydb.io/) • [Docs](https://dragonflydb.io/docs) • [Quick Start](https://www.dragonflydb.io/docs/getting-started) • [Community Discord](https://discord.gg/HsPjXGVH85) • [Dragonfly Forum](https://dragonfly.discourse.group/) • [Join the Dragonfly Community](https://www.dragonflydb.io/community)
+
+[GitHub Discussions](https://github.com/dragonflydb/dragonfly/discussions) • [GitHub Issues](https://github.com/dragonflydb/dragonfly/issues) • [Contributing](https://github.com/dragonflydb/dragonfly/blob/main/CONTRIBUTING.md) • [Dragonfly Cloud](https://www.dragonflydb.io/cloud)
 
 ## 세상에서 가장 빠른 인-메모리 스토어
 
@@ -109,7 +111,7 @@ Dragonfly는 현재 아래와 같은 Redis 인수들을 지원합니다 :
   * `admin_bind`: 주어진 주소에 관리자 콘솔 TCP 연결을 바인딩합니다. (`기본값: any`). HTTP와 RESP 프로토콜 모두를 지원합니다.
   * `admin_nopass`: 할당된 포트에 대해서 인증 토큰 없이 관리자 콘솔 접근을 활성화합니다. (`default: false`). HTTP와 RESP 프로토콜 모두를 지원합니다.
   * `cluster_mode`: 클러스터 모드가 지원됩니다. (`기본값: ""`). 현재는`emulated` 만 지원합니다.
-  * `cluster_announce_ip`: 클러스터 명령을 클라이언트에게 알리는 IP 주소.
+  * `announce_ip`: 클러스터 명령을 클라이언트에게 알리는 IP 주소.
 
 
 ### 주요 옵션을 활용한 실행 스크립트 예시:

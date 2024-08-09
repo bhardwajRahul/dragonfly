@@ -11,9 +11,6 @@ class Proxy:
         self.stop_connections = []
         self.server = None
 
-    def __del__(self):
-        self.close()
-
     async def handle(self, reader, writer):
         remote_reader, remote_writer = await asyncio.open_connection(
             self.remote_host, self.remote_port

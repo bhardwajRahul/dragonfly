@@ -117,7 +117,7 @@ class BaseFamilyTest : public ::testing::Test {
   static std::vector<std::string> StrArray(const RespExpr& expr);
 
   Metrics GetMetrics() const {
-    return service_->server_family().GetMetrics();
+    return service_->server_family().GetMetrics(&namespaces.GetDefaultNamespace());
   }
 
   void ClearMetrics();
@@ -154,7 +154,7 @@ class BaseFamilyTest : public ::testing::Test {
 
   static void SetTestFlag(std::string_view flag_name, std::string_view new_value);
 
-  void TestInitAclFam();
+  const acl::AclFamily* TestInitAclFam();
 
   std::unique_ptr<util::ProactorPool> pp_;
   std::unique_ptr<Service> service_;

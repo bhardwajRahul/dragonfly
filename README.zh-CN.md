@@ -11,7 +11,9 @@
 
 其他语言:  [English](README.md) [日本語](README.ja-JP.md) [한국어](README.ko-KR.md)
 
-[主页](https://dragonflydb.io/) • [快速入门](https://github.com/dragonflydb/dragonfly/tree/main/docs/quick-start) • [Discord社区](https://discord.gg/HsPjXGVH85) • [GitHub Discussions](https://github.com/dragonflydb/dragonfly/discussions) | [GitHub Issues](https://github.com/dragonflydb/dragonfly/issues) | [贡献指南](https://github.com/dragonflydb/dragonfly/blob/main/CONTRIBUTING.md)
+[主页](https://dragonflydb.io/) • [快速入门](https://github.com/dragonflydb/dragonfly/tree/main/docs/quick-start) • [社区 Discord](https://discord.gg/HsPjXGVH85) • [Dragonfly 论坛](https://dragonfly.discourse.group/) • [加入 Dragonfly 社区](https://www.dragonflydb.io/community)
+
+[GitHub Discussions](https://github.com/dragonflydb/dragonfly/discussions) • [GitHub Issues](https://github.com/dragonflydb/dragonfly/issues) • [贡献指南](https://github.com/dragonflydb/dragonfly/blob/main/CONTRIBUTING.md)
 
 ## 全世界最快的内存数据库
 
@@ -133,7 +135,7 @@ Dragonfly 支持 Redis 的常见参数。
 
 * `cluster_mode`：支持集群模式。目前仅支持 `emulated`。默认为空 `""`。
 
-* `cluster_announce_ip`：集群模式下向客户端公开的 IP。
+* `announce_ip`：集群模式下向客户端公开的 IP。
 
 ### 启动脚本示例，包含常用选项：
 

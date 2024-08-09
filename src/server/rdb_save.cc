@@ -35,6 +35,7 @@ extern "C" {
 #include "server/engine_shard_set.h"
 #include "server/error.h"
 #include "server/main_service.h"
+#include "server/namespaces.h"
 #include "server/rdb_extensions.h"
 #include "server/search/doc_index.h"
 #include "server/serializer_commons.h"
@@ -292,7 +293,9 @@ SerializerBase::SerializerBase(CompressionMode compression_mode)
     : compression_mode_(compression_mode), mem_buf_{4_KB}, tmp_buf_(nullptr) {
 }
 
-RdbSerializer::RdbSerializer(CompressionMode compression_mode) : SerializerBase(compression_mode) {
+RdbSerializer::RdbSerializer(CompressionMode compression_mode,
+                             std::function<void(size_t, SerializerBase::FlushState)> flush_fun)
+    : SerializerBase(compression_mode), flush_fun_(std::move(flush_fun)) {
 }
 
 RdbSerializer::~RdbSerializer() {
@@ -430,6 +433,10 @@ error_code RdbSerializer::SaveListObject(const PrimeValue& pv) {
         RETURN_ON_ERR(SaveLzfBlob(Bytes{reinterpret_cast<uint8_t*>(data), compress_len}, node->sz));
       } else {
         RETURN_ON_ERR(SaveString(node->entry, node->sz));
+        FlushState flush_state = FlushState::kFlushMidEntry;
+        if (node->next == nullptr)
+          flush_state = FlushState::kFlushEndEntry;
+        FlushIfNeeded(flush_state);
       }
     } else {
       // listpack
@@ -465,8 +472,7 @@ error_code RdbSerializer::SaveSetObject(const PrimeValue& obj) {
     StringSet* set = (StringSet*)obj.RObjPtr();
 
     RETURN_ON_ERR(SaveLen(set->SizeSlow()));
-
-    for (auto it = set->begin(); it != set->end(); ++it) {
+    for (auto it = set->begin(); it != set->end();) {
       RETURN_ON_ERR(SaveString(string_view{*it, sdslen(*it)}));
       if (set->ExpirationUsed()) {
         int64_t expiry = -1;
@@ -474,6 +480,11 @@ error_code RdbSerializer::SaveSetObject(const PrimeValue& obj) {
           expiry = it.ExpiryTime();
         RETURN_ON_ERR(SaveLongLongAsString(expiry));
       }
+      ++it;
+      FlushState flush_state = FlushState::kFlushMidEntry;
+      if (it == set->end())
+        flush_state = FlushState::kFlushEndEntry;
+      FlushIfNeeded(flush_state);
     }
   } else {
     CHECK_EQ(obj.Encoding(), kEncodingIntSet);
@@ -494,7 +505,7 @@ error_code RdbSerializer::SaveHSetObject(const PrimeValue& pv) {
 
     RETURN_ON_ERR(SaveLen(string_map->SizeSlow()));
 
-    for (auto it = string_map->begin(); it != string_map->end(); ++it) {
+    for (auto it = string_map->begin(); it != string_map->end();) {
       const auto& [k, v] = *it;
       RETURN_ON_ERR(SaveString(string_view{k, sdslen(k)}));
       RETURN_ON_ERR(SaveString(string_view{v, sdslen(v)}));
@@ -504,6 +515,11 @@ error_code RdbSerializer::SaveHSetObject(const PrimeValue& pv) {
           expiry = it.ExpiryTime();
         RETURN_ON_ERR(SaveLongLongAsString(expiry));
       }
+      ++it;
+      FlushState flush_state = FlushState::kFlushMidEntry;
+      if (it == string_map->end())
+        flush_state = FlushState::kFlushEndEntry;
+      FlushIfNeeded(flush_state);
     }
   } else {
     CHECK_EQ(kEncodingListPack, pv.Encoding());
@@ -530,13 +546,21 @@ error_code RdbSerializer::SaveZSetObject(const PrimeValue& pv) {
      * element will always be the smaller, so adding to the skiplist
      * will always immediately stop at the head, making the insertion
      * O(1) instead of O(log(N)). */
-    zs->Iterate(0, zs->Size(), true, [&](sds ele, double score) {
+    const size_t total = zs->Size();
+    size_t count = 0;
+    zs->Iterate(0, total, true, [&](sds ele, double score) mutable {
       ec = SaveString(string_view{ele, sdslen(ele)});
       if (ec)
         return false;
       ec = SaveBinaryDouble(score);
       if (ec)
         return false;
+      ++count;
+      FlushState flush_state = FlushState::kFlushMidEntry;
+      if (count == total)
+        flush_state = FlushState::kFlushEndEntry;
+
+      FlushIfNeeded(flush_state);
       return true;
     });
   } else {
@@ -647,6 +671,11 @@ std::error_code RdbSerializer::SaveSBFObject(const PrimeValue& pv) {
 
     string_view blob = sbf->data(i);
     RETURN_ON_ERR(SaveString(blob));
+    FlushState flush_state = FlushState::kFlushMidEntry;
+    if ((i + 1) == sbf->num_filters())
+      flush_state = FlushState::kFlushEndEntry;
+
+    FlushIfNeeded(flush_state);
   }
 
   return {};
@@ -806,22 +835,22 @@ error_code SerializerBase::WriteRaw(const io::Bytes& buf) {
   return error_code{};
 }
 
-error_code SerializerBase::FlushToSink(io::Sink* s) {
-  auto bytes = PrepareFlush();
+error_code SerializerBase::FlushToSink(io::Sink* sink, SerializerBase::FlushState flush_state) {
+  auto bytes = PrepareFlush(flush_state);
   if (bytes.empty())
     return error_code{};
 
   DVLOG(2) << "FlushToSink " << bytes.size() << " bytes";
 
   // interrupt point.
-  RETURN_ON_ERR(s->Write(bytes));
+  RETURN_ON_ERR(sink->Write(bytes));
   mem_buf_.ConsumeInput(bytes.size());
 
   return error_code{};
 }
 
-error_code RdbSerializer::FlushToSink(io::Sink* s) {
-  RETURN_ON_ERR(SerializerBase::FlushToSink(s));
+error_code RdbSerializer::FlushToSink(io::Sink* s, SerializerBase::FlushState flush_state) {
+  RETURN_ON_ERR(SerializerBase::FlushToSink(s, flush_state));
 
   // After every flush we should write the DB index again because the blobs in the channel are
   // interleaved and multiple savers can correspond to a single writer (in case of single file rdb
@@ -883,7 +912,7 @@ void SerializerBase::DumpObject(const CompactObj& obj, io::StringSink* out) {
   CHECK(!ec);
   ec = serializer.SaveValue(obj);
   CHECK(!ec);  // make sure that fully was successful
-  ec = serializer.FlushToSink(out);
+  ec = serializer.FlushToSink(out, SerializerBase::FlushState::kFlushMidEntry);
   CHECK(!ec);         // make sure that fully was successful
   AppendFooter(out);  // version and crc
   CHECK_GT(out->str().size(), 10u);
@@ -893,15 +922,20 @@ size_t SerializerBase::SerializedLen() const {
   return mem_buf_.InputLen();
 }
 
-io::Bytes SerializerBase::PrepareFlush() {
+io::Bytes SerializerBase::PrepareFlush(SerializerBase::FlushState flush_state) {
   size_t sz = mem_buf_.InputLen();
   if (sz == 0)
     return mem_buf_.InputBuffer();
 
-  if (compression_mode_ == CompressionMode::MULTI_ENTRY_ZSTD ||
-      compression_mode_ == CompressionMode::MULTI_ENTRY_LZ4) {
-    CompressBlob();
+  bool is_last_chunk = flush_state == FlushState::kFlushEndEntry;
+  if (is_last_chunk && number_of_chunks_ == 0) {
+    if (compression_mode_ == CompressionMode::MULTI_ENTRY_ZSTD ||
+        compression_mode_ == CompressionMode::MULTI_ENTRY_LZ4) {
+      CompressBlob();
+    }
   }
+
+  number_of_chunks_ = is_last_chunk ? 0 : (number_of_chunks_ + 1);
 
   return mem_buf_.InputBuffer();
 }
@@ -1087,7 +1121,9 @@ class RdbSaver::Impl {
 
   RdbSaver::SnapshotStats GetCurrentSnapshotProgress() const;
 
-  error_code Flush() {
+  error_code FlushSerializer();
+
+  error_code FlushSink() {
     return aligned_buf_ ? aligned_buf_->Flush() : error_code{};
   }
 
@@ -1099,14 +1135,15 @@ class RdbSaver::Impl {
     return &meta_serializer_;
   }
 
-  io::Sink* sink() {
-    return sink_;
+  int64_t last_write_ts() const {
+    return last_write_time_ns_;
   }
 
  private:
   unique_ptr<SliceSnapshot>& GetSnapshot(EngineShard* shard);
 
   io::Sink* sink_;
+  int64_t last_write_time_ns_ = -1;  // last write call.
   vector<unique_ptr<SliceSnapshot>> shard_snapshots_;
   // used for serializing non-body components in the calling fiber.
   RdbSerializer meta_serializer_;
@@ -1118,6 +1155,7 @@ class RdbSaver::Impl {
   // Multi entry compression is available only on df snapshot, this will
   // make snapshot size smaller and opreation faster.
   CompressionMode compression_mode_;
+  SaveMode save_mode_;
 };
 
 // We pass K=sz to say how many producers are pushing data in order to maintain
@@ -1139,6 +1177,7 @@ RdbSaver::Impl::Impl(bool align_writes, unsigned producers_len, CompressionMode 
   }
 
   DCHECK(producers_len > 0 || channel_.IsClosing());
+  save_mode_ = sm;
 }
 
 void RdbSaver::Impl::CleanShardSnapshots() {
@@ -1216,6 +1255,7 @@ error_code RdbSaver::Impl::ConsumeChannel(const Cancellation* cll) {
   std::optional<SliceSnapshot::DbRecord> record;
 
   RecordsPopper records_popper(push_to_sink_with_order_, &channel_);
+  auto& stats = ServerState::tlocal()->stats;
 
   // we can not exit on io-error since we spawn fibers that push data.
   // TODO: we may signal them to stop processing and exit asap in case of the error.
@@ -1228,12 +1268,14 @@ error_code RdbSaver::Impl::ConsumeChannel(const Cancellation* cll) {
         continue;
 
       DVLOG(2) << "Pulled " << record->id;
-      auto before = absl::GetCurrentTimeNanos();
+      last_write_time_ns_ = absl::GetCurrentTimeNanos();
       io_error = sink_->Write(io::Buffer(record->value));
-      auto& stats = ServerState::tlocal()->stats;
-      stats.rdb_save_usec += (absl::GetCurrentTimeNanos() - before) / 1'000;
+
+      stats.rdb_save_usec += (absl::GetCurrentTimeNanos() - last_write_time_ns_) / 1'000;
       stats.rdb_save_count++;
+      last_write_time_ns_ = -1;
       if (io_error) {
+        VLOG(1) << "Error writing to sink " << io_error.message();
         break;
       }
     } while ((record = records_popper.TryPop()));
@@ -1251,15 +1293,19 @@ error_code RdbSaver::Impl::ConsumeChannel(const Cancellation* cll) {
 void RdbSaver::Impl::StartSnapshotting(bool stream_journal, const Cancellation* cll,
                                        EngineShard* shard) {
   auto& s = GetSnapshot(shard);
-  s = std::make_unique<SliceSnapshot>(&shard->db_slice(), &channel_, compression_mode_);
+  auto& db_slice = namespaces.GetDefaultNamespace().GetDbSlice(shard->shard_id());
+  s = std::make_unique<SliceSnapshot>(&db_slice, &channel_, compression_mode_);
 
-  s->Start(stream_journal, cll);
+  const auto allow_flush = (save_mode_ != SaveMode::RDB) ? SliceSnapshot::SnapshotFlush::kAllow
+                                                         : SliceSnapshot::SnapshotFlush::kDisallow;
+  s->Start(stream_journal, cll, allow_flush);
 }
 
 void RdbSaver::Impl::StartIncrementalSnapshotting(Context* cntx, EngineShard* shard,
                                                   LSN start_lsn) {
+  auto& db_slice = namespaces.GetDefaultNamespace().GetDbSlice(shard->shard_id());
   auto& s = GetSnapshot(shard);
-  s = std::make_unique<SliceSnapshot>(&shard->db_slice(), &channel_, compression_mode_);
+  s = std::make_unique<SliceSnapshot>(&db_slice, &channel_, compression_mode_);
 
   s->StartIncremental(cntx, start_lsn);
 }
@@ -1327,6 +1373,13 @@ RdbSaver::SnapshotStats RdbSaver::Impl::GetCurrentSnapshotProgress() const {
       results.begin(), results.end(), init, [](auto init, auto pr) -> RdbSaver::SnapshotStats {
         return {init.current_keys + pr.current_keys, init.total_keys + pr.total_keys};
       });
+}
+
+error_code RdbSaver::Impl::FlushSerializer() {
+  last_write_time_ns_ = absl::GetCurrentTimeNanos();
+  auto ec = serializer()->FlushToSink(sink_, SerializerBase::FlushState::kFlushMidEntry);
+  last_write_time_ns_ = -1;
+  return ec;
 }
 
 RdbSaver::GlobalData RdbSaver::GetGlobalData(const Service* service) {
@@ -1431,7 +1484,7 @@ error_code RdbSaver::SaveHeader(const GlobalData& glob_state) {
 }
 
 error_code RdbSaver::SaveBody(Context* cntx, RdbTypeFreqMap* freq_map) {
-  RETURN_ON_ERR(impl_->serializer()->FlushToSink(impl_->sink()));
+  RETURN_ON_ERR(impl_->FlushSerializer());
 
   if (save_mode_ == SaveMode::SUMMARY) {
     impl_->serializer()->SendFullSyncCut();
@@ -1439,7 +1492,6 @@ error_code RdbSaver::SaveBody(Context* cntx, RdbTypeFreqMap* freq_map) {
     VLOG(1) << "SaveBody , snapshots count: " << impl_->Size();
     error_code io_error = impl_->ConsumeChannel(cntx->GetCancellation());
     if (io_error) {
-      LOG(ERROR) << "io error " << io_error;
       return io_error;
     }
     if (cntx->GetError()) {
@@ -1506,9 +1558,9 @@ error_code RdbSaver::SaveEpilog() {
   absl::little_endian::Store64(buf, chksum);
   RETURN_ON_ERR(ser.WriteRaw(buf));
 
-  RETURN_ON_ERR(ser.FlushToSink(impl_->sink()));
+  RETURN_ON_ERR(impl_->FlushSerializer());
 
-  return impl_->Flush();
+  return impl_->FlushSink();
 }
 
 error_code RdbSaver::SaveAuxFieldStrInt(string_view key, int64_t val) {
@@ -1527,6 +1579,10 @@ size_t RdbSaver::GetTotalBuffersSize() const {
 
 RdbSaver::SnapshotStats RdbSaver::GetCurrentSnapshotProgress() const {
   return impl_->GetCurrentSnapshotProgress();
+}
+
+int64_t RdbSaver::GetLastWriteTime() const {
+  return impl_->last_write_ts();
 }
 
 void SerializerBase::AllocateCompressorOnce() {
@@ -1592,6 +1648,12 @@ void SerializerBase::CompressBlob() {
 
 size_t RdbSerializer::GetTempBufferSize() const {
   return SerializerBase::GetTempBufferSize() + tmp_str_.size();
+}
+
+void RdbSerializer::FlushIfNeeded(SerializerBase::FlushState flush_state) {
+  if (flush_fun_) {
+    flush_fun_(SerializedLen(), flush_state);
+  }
 }
 
 }  // namespace dfly

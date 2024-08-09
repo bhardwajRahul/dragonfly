@@ -10,9 +10,11 @@ from pathlib import Path
 import boto3
 from .instance import RedisServer
 from random import randint as rand
+import string
+import random
 
 from . import dfly_args
-from .utility import wait_available_async, chunked, is_saving
+from .utility import wait_available_async, is_saving, tmp_file_name
 
 from .seeder import StaticSeeder
 
@@ -43,7 +45,7 @@ async def test_consistency(df_factory, format: str, seeder_opts: dict):
     """
     Test consistency over a large variety of data with different sizes
     """
-    dbfilename = f"test-consistency{rand(0, 5000)}"
+    dbfilename = f"dump_{tmp_file_name()}"
     instance = df_factory.create(dbfilename=dbfilename)
     instance.start()
     async_client = instance.client()
@@ -376,8 +378,7 @@ class TestDflySnapshotOnShutdown:
 @pytest.mark.parametrize("format", FILE_FORMATS)
 @dfly_args({**BASIC_ARGS, "dbfilename": "info-while-snapshot"})
 async def test_infomemory_while_snapshoting(df_factory, format: str):
-    dbfilename = f"test-consistency{rand(0, 5000)}"
-    instance = df_factory.create(dbfilename=dbfilename)
+    instance = df_factory.create(dbfilename=f"dump_{tmp_file_name()}")
     instance.start()
     async_client = instance.client()
     await async_client.execute_command("DEBUG POPULATE 10000 key 4048 RAND")
@@ -501,3 +502,55 @@ async def test_tiered_entries_throttle(async_client: aioredis.Redis):
 
     await load_task
     assert await StaticSeeder.capture(async_client) == start_capture
+
+
+@dfly_args({"proactor_threads": 1})
+@pytest.mark.parametrize(
+    "query",
+    [
+        ("HSET"),
+        ("SADD"),
+        ("ZSET"),
+        ("LIST"),
+    ],
+)
+async def test_big_value_serialization_memory_limit(df_factory, query):
+    dbfilename = f"dump_{tmp_file_name()}"
+    instance = df_factory.create(dbfilename=dbfilename)
+    instance.start()
+    client = instance.client()
+
+    ten_mb = 10_000_000
+
+    def ten_mb_random_string():
+        return "".join(random.choices(string.ascii_letters, k=ten_mb))
+
+    one_gb = 1_000_000_000  # 1GB
+
+    upper_limit = one_gb * 1.1  # 1GB + 100MB
+
+    i = 0
+
+    while instance.rss < one_gb:
+        if query == "HSET":
+            i = i + 1
+            await client.execute_command(f"HSET foo_key foo_{i} {ten_mb_random_string()}")
+        elif query == "SADD":
+            await client.execute_command(f"SADD foo_key {ten_mb_random_string()}")
+        elif query == "ZSET":
+            await client.execute_command(f"ZADD foo_key {i} {ten_mb_random_string()}")
+        elif query == "LIST":
+            await client.execute_command(f"LPUSH foo_key {ten_mb_random_string()}")
+
+    async def check_memory_usage(instance):
+        while True:
+            assert instance.rss < upper_limit
+            await asyncio.sleep(0.01)
+
+    checker = asyncio.create_task(check_memory_usage(instance))
+
+    await client.execute_command("SAVE")
+
+    checker.cancel()
+    await client.execute_command("FLUSHALL")
+    await client.close()

@@ -60,8 +60,9 @@ OpResult<string> FindFirstNonEmptySingleShard(Transaction* trans, int req_obj_ty
   DCHECK_EQ(trans->GetUniqueShardCnt(), 1u);
   string key;
   auto cb = [&](Transaction* t, EngineShard* shard) -> Transaction::RunnableResult {
-    auto args = t->GetShardArgs(shard->shard_id());
-    auto ff_res = FindFirstReadOnly(shard->db_slice(), t->GetDbContext(), args, req_obj_type);
+    ShardId sid = shard->shard_id();
+    auto args = t->GetShardArgs(sid);
+    auto ff_res = FindFirstReadOnly(t->GetDbSlice(sid), t->GetDbContext(), args, req_obj_type);
 
     if (ff_res == OpStatus::WRONG_TYPE)
       return OpStatus::WRONG_TYPE;
@@ -96,8 +97,9 @@ OpResult<ShardFFResult> FindFirstNonEmpty(Transaction* trans, int req_obj_type) 
   std::fill(find_res.begin(), find_res.end(), OpStatus::KEY_NOTFOUND);
 
   auto cb = [&](Transaction* t, EngineShard* shard) {
-    auto args = t->GetShardArgs(shard->shard_id());
-    auto ff_res = FindFirstReadOnly(shard->db_slice(), t->GetDbContext(), args, req_obj_type);
+    ShardId sid = shard->shard_id();
+    auto args = t->GetShardArgs(sid);
+    auto ff_res = FindFirstReadOnly(t->GetDbSlice(sid), t->GetDbContext(), args, req_obj_type);
     if (ff_res) {
       find_res[shard->shard_id()] =
           FFResult{ff_res->first->first.AsRef(), ff_res->second, shard->shard_id()};
@@ -114,7 +116,7 @@ OpResult<ShardFFResult> FindFirstNonEmpty(Transaction* trans, int req_obj_type) 
     return OpStatus::WRONG_TYPE;
 
   // Order result by their keys position in the command arguments, push errors to back
-  auto comp = [trans](const OpResult<FFResult>& lhs, const OpResult<FFResult>& rhs) {
+  auto comp = [](const OpResult<FFResult>& lhs, const OpResult<FFResult>& rhs) {
     if (!lhs || !rhs)
       return lhs.ok();
     size_t i1 = std::get<1>(*lhs);
@@ -337,9 +339,10 @@ OpResult<string> RunCbOnFirstNonEmptyBlocking(Transaction* trans, int req_obj_ty
   }
 
   auto wcb = [](Transaction* t, EngineShard* shard) { return t->GetShardArgs(shard->shard_id()); };
-  const auto key_checker = [req_obj_type](EngineShard* owner, const DbContext& context,
-                                          Transaction*, std::string_view key) -> bool {
-    return owner->db_slice().FindReadOnly(context, key, req_obj_type).ok();
+  auto* ns = &trans->GetNamespace();
+  const auto key_checker = [req_obj_type, ns](EngineShard* owner, const DbContext& context,
+                                              Transaction*, std::string_view key) -> bool {
+    return ns->GetDbSlice(owner->shard_id()).FindReadOnly(context, key, req_obj_type).ok();
   };
 
   auto status = trans->WaitOnWatch(limit_tp, std::move(wcb), key_checker, block_flag, pause_flag);

@@ -1,4 +1,4 @@
-// Copyright 2022, DragonflyDB authors.  All rights reserved.
+// Copyright 2024, DragonflyDB authors.  All rights reserved.
 // See LICENSE for licensing terms.
 //
 
@@ -8,6 +8,9 @@
 #include <absl/strings/match.h>
 #include <absl/strings/str_cat.h>
 
+#include <mutex>
+
+#include "base/flags.h"
 #include "base/logging.h"
 #include "core/heap_size.h"
 #include "server/db_slice.h"
@@ -16,6 +19,13 @@
 #include "server/rdb_extensions.h"
 #include "server/rdb_save.h"
 #include "server/tiered_storage.h"
+#include "util/fibers/synchronization.h"
+
+using facade::operator""_MB;
+ABSL_FLAG(size_t, serialization_max_chunk_size, 0,
+          "Maximum size of a value that may be serialized at once during snapshotting or full "
+          "sync. Values bigger than this threshold will be serialized using streaming "
+          "serialization. 0 - to disable streaming mode");
 
 namespace dfly {
 
@@ -53,7 +63,7 @@ bool SliceSnapshot::IsSnaphotInProgress() {
   return tl_slice_snapshots.size() > 0;
 }
 
-void SliceSnapshot::Start(bool stream_journal, const Cancellation* cll) {
+void SliceSnapshot::Start(bool stream_journal, const Cancellation* cll, SnapshotFlush allow_flush) {
   DCHECK(!snapshot_fb_.IsJoinable());
 
   auto db_cb = absl::bind_front(&SliceSnapshot::OnDbChange, this);
@@ -66,7 +76,18 @@ void SliceSnapshot::Start(bool stream_journal, const Cancellation* cll) {
     journal_cb_id_ = journal->RegisterOnChange(std::move(journal_cb));
   }
 
-  serializer_ = std::make_unique<RdbSerializer>(compression_mode_);
+  const auto flush_threshold = absl::GetFlag(FLAGS_serialization_max_chunk_size);
+  std::function<void(size_t, RdbSerializer::FlushState)> flush_fun;
+  if (flush_threshold != 0 && allow_flush == SnapshotFlush::kAllow) {
+    flush_fun = [this, flush_threshold](size_t bytes_serialized,
+                                        RdbSerializer::FlushState flush_state) {
+      if (bytes_serialized > flush_threshold) {
+        auto serialized = Serialize(flush_state);
+        VLOG(2) << "FlushedToChannel " << serialized << " bytes";
+      }
+    };
+  }
+  serializer_ = std::make_unique<RdbSerializer>(compression_mode_, flush_fun);
 
   VLOG(1) << "DbSaver::Start - saving entries with version less than " << snapshot_version_;
 
@@ -203,7 +224,7 @@ void SliceSnapshot::IterateBucketsFb(const Cancellation* cll, bool send_full_syn
         return;
 
       PrimeTable::Cursor next =
-          pt->Traverse(cursor, absl::bind_front(&SliceSnapshot::BucketSaveCb, this));
+          db_slice_->Traverse(pt, cursor, absl::bind_front(&SliceSnapshot::BucketSaveCb, this));
       cursor = next;
       PushSerializedToChannel(false);
 
@@ -237,28 +258,31 @@ void SliceSnapshot::IterateBucketsFb(const Cancellation* cll, bool send_full_syn
 bool SliceSnapshot::BucketSaveCb(PrimeIterator it) {
   ++stats_.savecb_calls;
 
+  auto check = [&](auto v) {
+    if (v >= snapshot_version_) {
+      // either has been already serialized or added after snapshotting started.
+      DVLOG(3) << "Skipped " << it.segment_id() << ":" << it.bucket_id() << ":" << it.slot_id()
+               << " at " << v;
+      ++stats_.skipped;
+      return false;
+    }
+    return true;
+  };
+
   uint64_t v = it.GetVersion();
-  if (v >= snapshot_version_) {
-    // either has been already serialized or added after snapshotting started.
-    DVLOG(3) << "Skipped " << it.segment_id() << ":" << it.bucket_id() << ":" << it.slot_id()
-             << " at " << v;
-    ++stats_.skipped;
+  if (!check(v)) {
     return false;
   }
+
   db_slice_->FlushChangeToEarlierCallbacks(current_db_, DbSlice::Iterator::FromPrime(it),
                                            snapshot_version_);
 
   stats_.loop_serialized += SerializeBucket(current_db_, it);
+
   return false;
 }
 
 unsigned SliceSnapshot::SerializeBucket(DbIndex db_index, PrimeTable::bucket_iterator it) {
-  // Must be atomic because after after we call it.snapshot_version_ we're starting
-  // to send incremental updates instead of serializing the whole bucket: We must not
-  // send the update until the initial SerializeBucket is called.
-  // Relying on the atomicity of SerializeBucket is Ok here because only one thread may handle this
-  // bucket.
-  FiberAtomicGuard fg;
   DCHECK_LT(it.GetVersion(), snapshot_version_);
 
   // traverse physical bucket and write it into string file.
@@ -268,6 +292,7 @@ unsigned SliceSnapshot::SerializeBucket(DbIndex db_index, PrimeTable::bucket_ite
 
   while (!it.is_done()) {
     ++result;
+    // might preempt
     SerializeEntry(db_index, it->first, it->second, nullopt, serializer_.get());
     ++it;
   }
@@ -275,10 +300,11 @@ unsigned SliceSnapshot::SerializeBucket(DbIndex db_index, PrimeTable::bucket_ite
   return result;
 }
 
-// This function should not block and should not preempt because it's called
-// from SerializeBucket which should execute atomically.
 void SliceSnapshot::SerializeEntry(DbIndex db_indx, const PrimeKey& pk, const PrimeValue& pv,
                                    optional<uint64_t> expire, RdbSerializer* serializer) {
+  if (pv.IsExternal() && pv.IsCool())
+    return SerializeEntry(db_indx, pk, pv.GetCool().record->value, expire, serializer);
+
   time_t expire_time = expire.value_or(0);
   if (!expire && pv.HasExpire()) {
     auto eit = db_array_[db_indx]->expire.Find(pk);
@@ -300,20 +326,9 @@ void SliceSnapshot::SerializeEntry(DbIndex db_indx, const PrimeKey& pk, const Pr
   }
 }
 
-bool SliceSnapshot::PushSerializedToChannel(bool force) {
-  // Bucket serialization might have accumulated some delayed values.
-  // Because we can finally block in this function, we'll await and serialize them
-  while (!delayed_entries_.empty()) {
-    auto& entry = delayed_entries_.back();
-    serializer_->SaveEntry(entry.key, entry.value.Get(), entry.expire, entry.dbid);
-    delayed_entries_.pop_back();
-  }
-
-  if (!force && serializer_->SerializedLen() < 4096)
-    return false;
-
+size_t SliceSnapshot::Serialize(SerializerBase::FlushState flush_state) {
   io::StringFile sfile;
-  serializer_->FlushToSink(&sfile);
+  serializer_->FlushToSink(&sfile, flush_state);
 
   size_t serialized = sfile.val.size();
   if (serialized == 0)
@@ -324,16 +339,36 @@ bool SliceSnapshot::PushSerializedToChannel(bool force) {
   DbRecord db_rec{.id = id, .value = std::move(sfile.val)};
 
   dest_->Push(std::move(db_rec));
+  if (serialized != 0) {
+    VLOG(2) << "Pushed with Serialize() " << serialized << " bytes";
+  }
+  return serialized;
+}
 
-  VLOG(2) << "PushSerializedToChannel " << serialized << " bytes";
-  return true;
+bool SliceSnapshot::PushSerializedToChannel(bool force) {
+  if (!force && serializer_->SerializedLen() < 4096)
+    return false;
+
+  // Flush any of the leftovers to avoid interleavings
+  const auto serialized = Serialize();
+
+  // Bucket serialization might have accumulated some delayed values.
+  // Because we can finally block in this function, we'll await and serialize them
+  while (!delayed_entries_.empty()) {
+    auto& entry = delayed_entries_.back();
+    serializer_->SaveEntry(entry.key, entry.value.Get(), entry.expire, entry.dbid);
+    delayed_entries_.pop_back();
+  }
+
+  const auto total_serialized = Serialize() + serialized;
+  return total_serialized > 0;
 }
 
 void SliceSnapshot::OnDbChange(DbIndex db_index, const DbSlice::ChangeReq& req) {
-  FiberAtomicGuard fg;
   PrimeTable* table = db_slice_->GetTables(db_index).first;
+  const PrimeTable::bucket_iterator* bit = req.update();
 
-  if (const PrimeTable::bucket_iterator* bit = req.update()) {
+  if (bit) {
     if (bit->GetVersion() < snapshot_version_) {
       stats_.side_saved += SerializeBucket(db_index, *bit);
     }
@@ -351,14 +386,10 @@ void SliceSnapshot::OnDbChange(DbIndex db_index, const DbSlice::ChangeReq& req) 
 // no database switch can be performed between those two calls, because they are part of one
 // transaction.
 void SliceSnapshot::OnJournalEntry(const journal::JournalItem& item, bool await) {
-  // We ignore EXEC entries because we they have no meaning during
-  // the LOAD phase on replica.
-  if (item.opcode == journal::Op::EXEC)
-    return;
-
   // To enable journal flushing to sync after non auto journal command is executed we call
   // TriggerJournalWriteToSink. This call uses the NOOP opcode with await=true. Since there is no
   // additional journal change to serialize, it simply invokes PushSerializedToChannel.
+  std::unique_lock lk(*db_slice_->GetSerializationMutex());
   if (item.opcode != journal::Op::NOOP) {
     serializer_->WriteJournalEntry(item.data);
   }
@@ -371,6 +402,8 @@ void SliceSnapshot::OnJournalEntry(const journal::JournalItem& item, bool await)
 }
 
 void SliceSnapshot::CloseRecordChannel() {
+  std::unique_lock lk(*db_slice_->GetSerializationMutex());
+
   CHECK(!serialize_bucket_running_);
   // Make sure we close the channel only once with a CAS check.
   bool expected = false;

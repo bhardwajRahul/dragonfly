@@ -86,7 +86,7 @@ class RdbSaver {
   ~RdbSaver();
 
   // Initiates the serialization in the shard's thread.
-  // TODO: to implement break functionality to allow stopping early.
+  // cll allows breaking in the middle.
   void StartSnapshotInShard(bool stream_journal, const Cancellation* cll, EngineShard* shard);
 
   // Send only the incremental snapshot since start_lsn.
@@ -122,6 +122,10 @@ class RdbSaver {
   // Fetch global data to be serialized in summary part of a snapshot / full sync.
   static GlobalData GetGlobalData(const Service* service);
 
+  // Returns time in nanos of start of the last pending write interaction.
+  // Returns -1 if no write operations are currently pending.
+  int64_t GetLastWriteTime() const;
+
  private:
   class Impl;
 
@@ -139,6 +143,8 @@ class CompressorImpl;
 
 class SerializerBase {
  public:
+  enum class FlushState { kFlushMidEntry, kFlushEndEntry };
+
   explicit SerializerBase(CompressionMode compression_mode);
   virtual ~SerializerBase() = default;
 
@@ -149,7 +155,7 @@ class SerializerBase {
   size_t SerializedLen() const;
 
   // Flush internal buffer to sink.
-  virtual std::error_code FlushToSink(io::Sink* s);
+  virtual std::error_code FlushToSink(io::Sink* s, FlushState flush_state);
 
   size_t GetBufferCapacity() const;
   virtual size_t GetTempBufferSize() const;
@@ -172,7 +178,7 @@ class SerializerBase {
 
  protected:
   // Prepare internal buffer for flush. Compress it.
-  io::Bytes PrepareFlush();
+  io::Bytes PrepareFlush(FlushState flush_state);
 
   // If membuf data is compressable use compression impl to compress the data and write it to membuf
   void CompressBlob();
@@ -195,15 +201,17 @@ class SerializerBase {
   std::optional<CompressionStats> compression_stats_;
   base::PODArray<uint8_t> tmp_buf_;
   std::unique_ptr<LZF_HSLOT[]> lzf_;
+  size_t number_of_chunks_ = 0;
 };
 
 class RdbSerializer : public SerializerBase {
  public:
-  explicit RdbSerializer(CompressionMode compression_mode);
+  explicit RdbSerializer(CompressionMode compression_mode,
+                         std::function<void(size_t, FlushState)> flush_fun = {});
 
   ~RdbSerializer();
 
-  std::error_code FlushToSink(io::Sink* s) override;
+  std::error_code FlushToSink(io::Sink* s, FlushState flush_state) override;
   std::error_code SelectDb(uint32_t dbid);
 
   // Must be called in the thread to which `it` belongs.
@@ -215,7 +223,8 @@ class RdbSerializer : public SerializerBase {
   // This would work for either string or an object.
   // The arg pv is taken from it->second if accessing
   // this by finding the key. This function is used
-  // for the dump command - thus it is public function
+  // for the dump command - thus it is public function.
+  // This function might preempt if flush_fun_ is used.
   std::error_code SaveValue(const PrimeValue& pv);
 
   std::error_code SendJournalOffset(uint64_t journal_offset);
@@ -223,6 +232,7 @@ class RdbSerializer : public SerializerBase {
   size_t GetTempBufferSize() const override;
 
  private:
+  // Might preempt if flush_fun_ is used
   std::error_code SaveObject(const PrimeValue& pv);
   std::error_code SaveListObject(const PrimeValue& pv);
   std::error_code SaveSetObject(const PrimeValue& pv);
@@ -238,8 +248,12 @@ class RdbSerializer : public SerializerBase {
   std::error_code SaveStreamPEL(rax* pel, bool nacks);
   std::error_code SaveStreamConsumers(streamCG* cg);
 
+  // Might preempt
+  void FlushIfNeeded(FlushState flush_state);
+
   std::string tmp_str_;
   DbIndex last_entry_db_index_ = kInvalidDbId;
+  std::function<void(size_t, FlushState)> flush_fun_;
 };
 
 }  // namespace dfly
