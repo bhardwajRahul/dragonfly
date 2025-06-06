@@ -1840,7 +1840,9 @@ async def test_network_disconnect_small_buffer(df_factory, df_seeder_factory):
             await proxy.close(task)
 
     # Partial replication is currently not implemented so the following does not work
-    # assert master.is_in_logs("Partial sync requested from stale LSN")
+    master.stop()
+    lines = master.find_in_logs("Partial sync requested from stale LSN")
+    assert len(lines) > 0
 
 
 async def test_replica_reconnections_after_network_disconnect(df_factory, df_seeder_factory):
@@ -3169,3 +3171,27 @@ async def test_replicate_hset_with_expiry(df_factory: DflyInstanceFactory):
 
     assert "name" in result
     assert result["name"] == "1234"
+
+
+async def test_bug_5221(df_factory):
+    master = df_factory.create(
+        proactor_threads=1,
+        cache_mode="true",
+        maxmemory="256mb",
+        enable_heartbeat_eviction="true",
+        eviction_memory_budget_threshold=0.9,
+    )
+    replica = df_factory.create(proactor_threads=4)
+    df_factory.start_all([master, replica])
+
+    c_master = master.client()
+    c_replica = replica.client()
+    await c_replica.execute_command(f"replicaof localhost {master.port}")
+
+    # Fill master with test data
+    seeder = SeederV2(key_target=22000, data_size=1000)
+    await seeder.run(c_master, target_deviation=0.01)
+    await asyncio.sleep(1)
+    await seeder.run(c_master, target_deviation=0.01)
+    res = await c_master.execute_command("dbsize")
+    assert res > 0
