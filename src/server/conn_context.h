@@ -298,10 +298,6 @@ class ConnectionContext : public facade::ConnectionContext {
     return conn_state.db_index;
   }
 
-  bool IsOOM() {
-    return std::exchange(is_oom_, false);
-  }
-
   void ChangeSubscription(bool to_add, bool to_reply, CmdArgList args,
                           facade::RedisReplyBuilder* rb);
 
@@ -310,7 +306,6 @@ class ConnectionContext : public facade::ConnectionContext {
   void UnsubscribeAll(bool to_reply, facade::RedisReplyBuilder* rb);
   void PUnsubscribeAll(bool to_reply, facade::RedisReplyBuilder* rb);
   void ChangeMonitor(bool start);  // either start or stop monitor on a given connection
-  void SwitchTxCmd(const CommandId* cid);
 
   size_t UsedMemory() const override;
 
@@ -329,9 +324,6 @@ class ConnectionContext : public facade::ConnectionContext {
 
   // The related connection is bound to main listener or serves the memcached protocol
   bool has_main_or_memcache_listener = false;
-
-  // OOM reported while executing
-  bool is_oom_ = false;
 
  private:
   void EnableMonitoring(bool enable) {
