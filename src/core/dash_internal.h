@@ -403,6 +403,13 @@ class Segment {
   explicit Segment(size_t depth, PMR_NS::memory_resource* mr) : local_depth_(depth), mr_(mr) {
   }
 
+  ~Segment() {
+    Clear();
+  }
+
+  Segment(const Segment&) = delete;
+  Segment& operator=(const Segment&) = delete;
+
   // Returns (iterator, true) if insert succeeds,
   // (iterator, false) for duplicate and (invalid-iterator, false) if it's full
   template <typename K, typename V, typename Pred>
@@ -434,11 +441,11 @@ class Segment {
 
   template <bool UV = kUseVersion>
   std::enable_if_t<UV, uint64_t> GetVersion(PhysicalBid bid) const {
-    return bucket_[bid].GetVersion();
+    return GetBucket(bid).GetVersion();
   }
 
   template <bool UV = kUseVersion> std::enable_if_t<UV> SetVersion(PhysicalBid bid, uint64_t v) {
-    return bucket_[bid].SetVersion(v);
+    return GetBucket(bid).SetVersion(v);
   }
 
   // Traverses over Segment's bucket bid and calls cb(const Iterator& it) 0 or more times
@@ -671,11 +678,15 @@ template <typename KeyType, typename ValueType> class IteratorPair {
 // to billions.
 class DashCursor {
  public:
-  DashCursor(uint64_t val = 0) : val_(val) {
+  explicit DashCursor(uint64_t token = 0) : val_(token) {
   }
 
   DashCursor(uint8_t depth, uint32_t seg_id, PhysicalBid bid)
       : val_((uint64_t(seg_id) << (40 - depth)) | bid) {
+  }
+
+  static DashCursor end() {
+    return DashCursor{};
   }
 
   PhysicalBid bucket_id() const {
@@ -692,20 +703,12 @@ class DashCursor {
     return val_ >> (40 - depth);
   }
 
-  uint64_t value() const {
+  uint64_t token() const {
     return val_;
   }
 
   explicit operator bool() const {
     return val_ != 0;
-  }
-
-  bool operator==(const DashCursor& other) const {
-    return val_ == other.val_;
-  }
-
-  bool operator!=(const DashCursor& other) const {
-    return !(val_ == other.val_);
   }
 
  private:
@@ -1304,6 +1307,7 @@ void Segment<Key, Value, Policy>::Split(HFunc&& hfn, Segment* dest_right) {
 
 template <typename Key, typename Value, typename Policy>
 int Segment<Key, Value, Policy>::MoveToOther(bool own_items, unsigned from_bid, unsigned to_bid) {
+  assert(from_bid < kBucketNum && to_bid < kBucketNum);
   auto& src = bucket_[from_bid];
   uint32_t mask = src.GetProbe(!own_items);
   if (mask == 0) {
@@ -1415,10 +1419,10 @@ std::enable_if_t<UV, unsigned> Segment<Key, Value, Policy>::CVCOnInsert(uint64_t
   const Bucket& target = GetBucket(bid);
   const Bucket& neighbor = GetBucket(nid);
   uint8_t first = target.Size() > neighbor.Size() ? nid : bid;
-  unsigned cnt = 0;
 
   const Bucket& bfirst = bucket_[first];
   if (!bfirst.IsFull()) {
+    unsigned cnt = 0;
     if (!bfirst.IsEmpty() && bfirst.GetVersion() < ver_threshold) {
       bid_res[cnt++] = first;
     }
@@ -1428,7 +1432,8 @@ std::enable_if_t<UV, unsigned> Segment<Key, Value, Policy>::CVCOnInsert(uint64_t
   // both nid and bid are full.
   const LogicalBid after_next = NextBid(nid);
 
-  auto do_fun = [this, ver_threshold, &cnt, &bid_res](auto bid, auto nid) {
+  auto do_fun = [this, ver_threshold, &bid_res](auto bid, auto nid) {
+    unsigned cnt = 0;
     // We could tighten the checks here and below because
     // if nid is less than ver_threshold, than nid won't be affected and won't cross
     // ver_threshold as well.
@@ -1437,17 +1442,16 @@ std::enable_if_t<UV, unsigned> Segment<Key, Value, Policy>::CVCOnInsert(uint64_t
 
     if (!GetBucket(nid).IsEmpty() && GetBucket(nid).GetVersion() < ver_threshold)
       bid_res[cnt++] = nid;
+    return cnt;
   };
 
   if (CheckIfMovesToOther(true, nid, after_next)) {
-    do_fun(nid, after_next);
-    return cnt;
+    return do_fun(nid, after_next);
   }
 
   const uint8_t prev_bid = PrevBid(bid);
   if (CheckIfMovesToOther(false, bid, prev_bid)) {
-    do_fun(bid, prev_bid);
-    return cnt;
+    return do_fun(bid, prev_bid);
   }
 
   // Important to repeat exactly the insertion logic of InsertUnique.
@@ -1455,6 +1459,7 @@ std::enable_if_t<UV, unsigned> Segment<Key, Value, Policy>::CVCOnInsert(uint64_t
     PhysicalBid stash_bid = kBucketNum + ((bid + i) % kStashBucketNum);
     const Bucket& stash = GetBucket(stash_bid);
     if (!stash.IsFull()) {
+      unsigned cnt = 0;
       if (!stash.IsEmpty() && stash.GetVersion() < ver_threshold)
         bid_res[cnt++] = stash_bid;
 
@@ -1473,14 +1478,14 @@ std::enable_if_t<UV, unsigned> Segment<Key, Value, Policy>::CVCOnBump(uint64_t v
                                                                       uint8_t result_bid[3]) const {
   if (bid < kBucketNum) {
     // Right now we do not migrate entries from nid to bid, only from stash to normal buckets.
-    // The reason for this is that CVCBumpUp implementation swaps the slots of the same bucket
+    // The reason for this is that CVCOnBump implementation swaps the slots of the same bucket
     // so there is no further action needed.
     return 0;
   }
 
   // Stash case.
   // There are three actors (interesting buckets). The stash bucket, the target bucket and its
-  // adjacent bucket (probe). To understand the code below consider the cases in CVCBumpUp:
+  // adjacent bucket (probe). To understand the code below consider the cases in CVCOnBump:
   // 1. If the bid is not a stash bucket, then just swap the slots of the target.
   // 2. If there is empty space in target or probe bucket insert the slot there and remove
   //    it from the stash bucket.
@@ -1488,7 +1493,7 @@ std::enable_if_t<UV, unsigned> Segment<Key, Value, Policy>::CVCOnBump(uint64_t v
   //    bucket. Furthermore, if the target or the probe have one of their stash bits reference the
   //    stash, then the stash bit entry is cleared. In total 2 buckets are modified.
   // Case 1 is handled by the if statement above and cases 2 and 3 below. We should return via
-  // result_bid all the buckets(with version less than threshold) that CVCBumpUp will modify.
+  // result_bid all the buckets(with version less than threshold) that CVCOnBump will modify.
   // Note, that for case 2 & 3 we might return an extra bucket id even though this bucket was not
   // changed. An example of that is TryMoveFromStash which will first try to insert on the target
   // bucket and if that fails it will retry with the probe bucket. Since we don't really know
@@ -1519,7 +1524,8 @@ void Segment<Key, Value, Policy>::TraverseBucket(PhysicalBid bid, Cb&& cb) {
 
 template <typename Key, typename Value, typename Policy>
 template <typename Cb, typename HashFn>
-bool Segment<Key, Value, Policy>::TraverseLogicalBucket(uint8_t bid, HashFn&& hfun, Cb&& cb) const {
+bool Segment<Key, Value, Policy>::TraverseLogicalBucket(LogicalBid bid, HashFn&& hfun,
+                                                        Cb&& cb) const {
   assert(bid < kBucketNum);
 
   const Bucket& b = bucket_[bid];
@@ -1673,12 +1679,12 @@ auto Segment<Key, Value, Policy>::BumpUp(uint8_t bid, SlotId slot, Hash_t key_ha
 
   // update ptr for swapped items
   if (is_probing) {
-    unsigned prev_bid = PrevBid(swap_bid);
+    LogicalBid prev_bid = PrevBid(swap_bid);
     auto& prevb = bucket_[prev_bid];
     prevb.SetStashPtr(stash_pos, swap_fp, &swapb);
   } else {
     // stash_ptr resides in the current or the next bucket.
-    unsigned next_bid = NextBid(swap_bid);
+    LogicalBid next_bid = NextBid(swap_bid);
     swapb.SetStashPtr(stash_pos, swap_fp, bucket_ + next_bid);
   }
 

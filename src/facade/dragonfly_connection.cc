@@ -18,6 +18,7 @@
 #include "base/histogram.h"
 #include "base/io_buf.h"
 #include "base/logging.h"
+#include "base/stl_util.h"
 #include "core/heap_size.h"
 #include "facade/conn_context.h"
 #include "facade/dragonfly_listener.h"
@@ -56,10 +57,10 @@ ABSL_FLAG(string, admin_bind, "",
           "If set, the admin consol TCP connection would be bind the given address. "
           "This supports both HTTP and RESP protocols");
 
-ABSL_FLAG(uint64_t, request_cache_limit, 64_MB,
+ABSL_FLAG(facade::MemoryBytesFlag, request_cache_limit, 64_MB,
           "Amount of memory to use for request cache in bytes - per IO thread.");
 
-ABSL_FLAG(uint64_t, pipeline_buffer_limit, 128_MB,
+ABSL_FLAG(facade::MemoryBytesFlag, pipeline_buffer_limit, 128_MB,
           "Amount of memory to use for storing pipeline requests - per IO thread."
           "Please note that clients that send excecissively huge pipelines, "
           "may deadlock themselves. See https://github.com/dragonflydb/dragonfly/discussions/3997"
@@ -72,10 +73,10 @@ ABSL_FLAG(uint32_t, pipeline_queue_limit, 10000,
           "may require increasing this limit to prevent the risk of deadlocking."
           "See https://github.com/dragonflydb/dragonfly/discussions/3997 for details");
 
-ABSL_FLAG(uint64_t, publish_buffer_limit, 128_MB,
+ABSL_FLAG(facade::MemoryBytesFlag, publish_buffer_limit, 128_MB,
           "Amount of memory to use for storing pub commands in bytes - per IO thread");
 
-ABSL_FLAG(uint32_t, pipeline_squash, 10,
+ABSL_FLAG(uint32_t, pipeline_squash, 1,
           "Number of queued pipelined commands above which squashing is enabled, 0 means disabled");
 
 // When changing this constant, also update `test_large_cmd` test in connection_test.py.
@@ -87,7 +88,7 @@ ABSL_FLAG(uint64_t, max_bulk_len, 2u << 30,
           "Maximum bulk length that is "
           "allowed to be accepted when parsing RESP protocol");
 
-ABSL_FLAG(size_t, max_client_iobuf_len, 1u << 16,
+ABSL_FLAG(facade::MemoryBytesFlag, max_client_iobuf_len, 1u << 16,
           "Maximum io buffer length that is used to read client requests.");
 
 ABSL_FLAG(bool, migrate_connections, true,
@@ -261,13 +262,16 @@ void LogTraffic(uint32_t id, bool has_more, absl::Span<RespExpr> resp,
   }
 
   for (auto part : resp) {
-    blobs[index++] = iovec{.iov_base = const_cast<char*>(part.GetView().data()),
-                           .iov_len = part.GetView().size()};
-    if (index >= blobs.size()) {
-      if (!tl_traffic_logger.Write(blobs.data(), blobs.size())) {
-        return;
+    if (auto blob_len = part.GetView().size(); blob_len > 0) {
+      blobs[index++] =
+          iovec{.iov_base = const_cast<char*>(part.GetView().data()), .iov_len = blob_len};
+
+      if (index >= blobs.size()) {
+        if (!tl_traffic_logger.Write(blobs.data(), blobs.size())) {
+          return;
+        }
+        index = 0;
       }
-      index = 0;
     }
   }
 
@@ -506,6 +510,14 @@ void Connection::AsyncOperations::operator()(const AclUpdateMessage& msg) {
 
 void Connection::AsyncOperations::operator()(const PubMessage& pub_msg) {
   RedisReplyBuilder* rbuilder = (RedisReplyBuilder*)builder;
+
+  // Discard stale messages to not break the protocol after exiting "pubsub" mode.
+  // Even after removing all subscriptions, we still can receive messages delayed
+  // by inter-thread dispatches or backpressure.
+  // TODO: filter messages from channels the client unsubscribed from
+  if (self->cntx()->subscriptions == 0 &&
+      !base::_in(pub_msg.channel, {"unsubscribe", "punsubscribe"}))
+    return;
 
   if (pub_msg.should_unsubscribe) {
     rbuilder->StartCollection(3, RedisReplyBuilder::CollectionType::PUSH);
@@ -1641,7 +1653,8 @@ void Connection::AsyncFiber() {
       // We keep the batch mode enabled as long as the dispatch queue is not empty, relying on the
       // last command to reply and flush. If it doesn't reply (i.e. is a control message like
       // migrate), we have to flush manually.
-      if (dispatch_q_.empty() && !msg.IsReplying()) {
+      bool is_replying = msg.IsReplying();
+      if (dispatch_q_.empty() && !is_replying) {
         reply_builder_->Flush();
       }
 
@@ -1652,9 +1665,16 @@ void Connection::AsyncFiber() {
         return;  // don't set conn closing flag
       }
 
+      auto replies_recorded_before = reply_builder_->RepliesRecorded();
       cc_->async_dispatch = true;
       std::visit(async_op, msg.handle);
       cc_->async_dispatch = false;
+      // If last msg in queue was replying but nothing was replied during dispatch
+      // (i.e. pubsub message was discarded) we have to manually flush now.
+      if (dispatch_q_.empty() && is_replying &&
+          (replies_recorded_before == reply_builder_->RepliesRecorded())) {
+        reply_builder_->Flush();
+      }
       RecycleMessage(std::move(msg));
     }
 

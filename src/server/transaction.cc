@@ -318,10 +318,9 @@ void Transaction::StoreKeysInArgs(const KeyIndex& key_index) {
 }
 
 void Transaction::InitByKeys(const KeyIndex& key_index) {
-  if (key_index.start == full_args_.size()) {  // eval with 0 keys.
-    CHECK(absl::StartsWith(cid_->name(), "EVAL")) << cid_->name();
+  // Skip initialization for key-dependent transactions without keys
+  if ((key_index.end - key_index.start) + int(bool(key_index.bonus)) == 0)
     return;
-  }
 
   DCHECK_LT(key_index.start, full_args_.size());
 
@@ -565,8 +564,7 @@ string Transaction::DebugId(std::optional<ShardId> sid) const {
   if (sid) {
     absl::StrAppend(&res, ",mask[", *sid, "]=", int(shard_data_[SidToId(*sid)].local_mask),
                     ",is_armed=", DEBUG_IsArmedInShard(*sid),
-                    ",txqpos[]=", shard_data_[SidToId(*sid)].pq_pos,
-                    ",fail_state_print=", DEBUG_PrintFailState(*sid));
+                    ",txqpos[]=", shard_data_[SidToId(*sid)].pq_pos);
   }
   absl::StrAppend(&res, "}");
   return res;
@@ -978,6 +976,7 @@ const absl::flat_hash_set<std::pair<ShardId, LockFp>>& Transaction::GetMultiFps(
   return multi_->tag_fps;
 }
 
+#if 0
 string Transaction::DEBUG_PrintFailState(ShardId sid) const {
   auto res = StrCat(
       "usc: ", unique_shard_cnt_, ", name:", GetCId()->name(),
@@ -992,6 +991,7 @@ string Transaction::DEBUG_PrintFailState(ShardId sid) const {
   }
   return res;
 }
+#endif
 
 void Transaction::EnableShard(ShardId sid) {
   unique_shard_cnt_ = 1;
@@ -1601,7 +1601,7 @@ OpResult<KeyIndex> DetermineKeys(const CommandId* cid, CmdArgList args) {
 
     if (num_custom_keys == 0 &&
         (absl::StartsWith(name, "ZDIFF") || absl::StartsWith(name, "ZUNION") ||
-         absl::StartsWith(name, "ZINTER"))) {
+         absl::StartsWith(name, "ZINTER") || absl::EndsWith(name, "MPOP"))) {
       return OpStatus::AT_LEAST_ONE_KEY;
     }
 
